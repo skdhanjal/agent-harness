@@ -44,7 +44,7 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 
 | # | Pattern | Status |
 |---|---|---|
-| 1 | Structured Outputs | ⬜ not started |
+| 1 | Structured Outputs | ✅ done |
 | 2 | Tool Calling | ⬜ not started |
 | 3 | Prompt Ownership | ⬜ not started |
 | 4 | Context Construction | ⬜ not started |
