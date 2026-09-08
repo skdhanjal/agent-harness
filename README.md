@@ -47,7 +47,7 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 | 1 | Structured Outputs | ✅ done |
 | 2 | Tool Calling | ✅ done |
 | 3 | Prompt Ownership | ✅ done |
-| 4 | Context Construction | ⬜ not started |
+| 4 | Context Construction | ✅ done |
 | 5 | Control-Flow Ownership | ⬜ not started |
 | 6 | State and Memory | ⬜ not started |
 | 7 | Checkpointing & Safe Retries | ⬜ not started |
