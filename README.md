@@ -48,7 +48,7 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 | 2 | Tool Calling | ✅ done |
 | 3 | Prompt Ownership | ✅ done |
 | 4 | Context Construction | ✅ done |
-| 5 | Control-Flow Ownership | ⬜ not started |
+| 5 | Control-Flow Ownership | ✅ done |
 | 6 | State and Memory | ⬜ not started |
 | 7 | Checkpointing & Safe Retries | ⬜ not started |
 | 8 | Permission & Approval Gates | ⬜ not started |
