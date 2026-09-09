@@ -91,7 +91,13 @@ def test_schema_for_llm_reflects_registered_tools(registry: ToolRegistry) -> Non
     schemas = registry.schema_for_llm()
 
     assert len(schemas) == 1
-    assert schemas[0]["name"] == "add"
-    parameters = schemas[0]["parameters"]
+    # OpenAI's native tool-calling shape: {"type": "function", "function": {...}} --
+    # framework.py hands this list straight to the API's `tools=` kwarg, so it
+    # must match that wire format exactly, not a flattened shorthand.
+    assert schemas[0]["type"] == "function"
+    function = schemas[0]["function"]
+    assert isinstance(function, dict)
+    assert function["name"] == "add"
+    parameters = function["parameters"]
     assert isinstance(parameters, dict)
     assert "a" in parameters["properties"]

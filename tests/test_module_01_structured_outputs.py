@@ -23,7 +23,9 @@ class FakeChatClient:
         self._responses = responses
         self.call_count = 0
 
-    def create_completion(self, messages: list[dict[str, str]]) -> str:
+    def create_completion(
+        self, messages: list[dict[str, str]], tools: list[dict[str, object]]
+    ) -> str:
         response = self._responses[self.call_count]
         self.call_count += 1
         return response
