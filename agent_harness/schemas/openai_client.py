@@ -12,7 +12,7 @@ from typing import cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
 load_dotenv()
 
@@ -22,12 +22,16 @@ class OpenAIChatClient:
         self._client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self._model = model
 
-    def create_completion(self, messages: list[dict[str, str]]) -> str:
+    def create_completion(
+        self, messages: list[dict[str, str]], tools: list[dict[str, object]]
+    ) -> str:
         typed_messages = cast(list[ChatCompletionMessageParam], messages)
+        typed_tools = cast(list[ChatCompletionToolUnionParam], tools)
         response = self._client.chat.completions.create(
             model=self._model,
             messages=typed_messages,
             response_format={"type": "json_object"},
+            tools=typed_tools,
         )
         content = response.choices[0].message.content
         if content is None:

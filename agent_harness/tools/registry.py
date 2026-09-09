@@ -55,9 +55,12 @@ class ToolRegistry:
         """Tool schemas in a provider-agnostic shape; adapt per-provider at the edge."""
         return [
             {
-                "name": name,
-                "description": inspect.getdoc(fn) or "",
-                "parameters": model.model_json_schema(),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": inspect.getdoc(fn) or "",
+                    "parameters": model.model_json_schema(),
+                },
             }
             for name, (fn, model) in self._tools.items()
         ]

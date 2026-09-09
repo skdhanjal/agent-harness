@@ -11,7 +11,9 @@ from pydantic import BaseModel, ValidationError
 class ChatClient(Protocol):
     """Anything with this method shape works here — OpenAI, a mock, etc."""
 
-    def create_completion(self, messages: list[dict[str, str]]) -> str: ...
+    def create_completion(
+        self, messages: list[dict[str, str]], tools: list[dict[str, object]]
+    ) -> str: ...
 
 
 class StructuredOutputError(RuntimeError):
@@ -27,17 +29,19 @@ def _strip_code_fences(text: str) -> str:
     return stripped
 
 
-def generate_structured(
+def generate_structured[T: BaseModel](
     client: ChatClient,
-    schema: type[BaseModel],
+    schema: type[T],
     task_prompt: str,
     max_repairs: int = 3,
-) -> BaseModel:
+    tools: list[dict[str, object]] | None = None,
+) -> T:
     """Call the model and return a validated instance of `schema`.
 
     Raises StructuredOutputError if the model can't produce valid output
     within `max_repairs` attempts.
     """
+    tools = tools if tools is not None else []
     schema_json = json.dumps(schema.model_json_schema(), indent=2)
     messages: list[dict[str, str]] = [
         {
@@ -53,7 +57,7 @@ def generate_structured(
 
     last_error: ValidationError | None = None
     for _ in range(max_repairs + 1):
-        raw = client.create_completion(messages)
+        raw = client.create_completion(messages, tools)
         cleaned = _strip_code_fences(raw)
         try:
             return schema.model_validate_json(cleaned)

@@ -25,5 +25,5 @@ class LLMJudge:
             },
             {"role": "user", "content": trajectory},
         ]
-        raw = self._client.create_completion(messages)
+        raw = self._client.create_completion(messages, [])
         return int(raw.strip())

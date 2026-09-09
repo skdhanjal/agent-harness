@@ -18,7 +18,9 @@ class FakeChatClient:
     def __init__(self, response: str) -> None:
         self._response = response
 
-    def create_completion(self, messages: list[dict[str, str]]) -> str:
+    def create_completion(
+        self, messages: list[dict[str, str]], tools: list[dict[str, object]]
+    ) -> str:
         return self._response
 
 
