@@ -52,7 +52,7 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 | 6 | State and Memory | ✅ done |
 | 7 | Checkpointing & Safe Retries | ✅ done |
 | 8 | Permission & Approval Gates | ✅ done |
-| 9 | Tracing & Evals | ⬜ not started |
+| 9 | Tracing & Evals | ✅ done |
 | 10 | Adaptive Orchestration | ⬜ not started |
 
 See `docs/agent_harness_roadmap.md` for the full architecture, per-module
