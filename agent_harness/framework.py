@@ -103,10 +103,7 @@ class AgentHarness:
             tool_name=tool_name, args=action.tool_args, risk=risk, run_id=self.run_id
         )
 
-        print("Tool call pending action", pending)
-
         if not self.gate.check(pending):
-            print("[Tool approval required]", pending.tool_name, pending.risk)
             self.memory.add(f"DENIED: {tool_name} (risk={risk.name})")
             self.ledger.log(
                 TraceEvent(

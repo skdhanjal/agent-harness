@@ -25,6 +25,7 @@ class TraceLedger:
         self._path = Path(path)
 
     def log(self, event: TraceEvent) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a") as f:
             f.write(json.dumps(asdict(event)) + "\n")
 
