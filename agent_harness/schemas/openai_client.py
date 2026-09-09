@@ -13,7 +13,13 @@ from typing import cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
+
+from agent_harness.schemas.tool_calling import ChatTurn, ToolCallRequest
 
 load_dotenv()
 
@@ -51,3 +57,37 @@ class OpenAIChatClient:
         if content is None:
             raise RuntimeError("Model returned empty content")
         return content
+
+    def create_action_turn(
+        self, messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> ChatTurn:
+        """One native tool-calling turn: no forced JSON-object mode here --
+        the model replies as a normal chat participant, either requesting
+        tool calls (validated by the API against each tool's schema) or
+        writing a plain-text final answer.
+        """
+        typed_messages = cast(list[ChatCompletionMessageParam], messages)
+        if tools:
+            typed_tools = cast(list[ChatCompletionToolUnionParam], tools)
+            response = self._client.chat.completions.create(
+                model=self._model, messages=typed_messages, tools=typed_tools
+            )
+        else:
+            response = self._client.chat.completions.create(
+                model=self._model, messages=typed_messages
+            )
+
+        message = response.choices[0].message
+        # ToolRegistry.schema_for_llm() only ever emits `{"type": "function", ...}`
+        # tools, so a "custom" tool call is never expected here -- narrow to the
+        # function-call variant instead of widening ToolCallRequest to cover it.
+        tool_calls = [
+            ToolCallRequest(
+                id=call.id,
+                name=call.function.name,
+                arguments=json.loads(call.function.arguments) if call.function.arguments else {},
+            )
+            for call in message.tool_calls or []
+            if isinstance(call, ChatCompletionMessageFunctionToolCall)
+        ]
+        return ChatTurn(content=message.content, tool_calls=tool_calls)
