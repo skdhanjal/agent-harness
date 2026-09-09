@@ -50,7 +50,7 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 | 4 | Context Construction | ✅ done |
 | 5 | Control-Flow Ownership | ✅ done |
 | 6 | State and Memory | ✅ done |
-| 7 | Checkpointing & Safe Retries | ⬜ not started |
+| 7 | Checkpointing & Safe Retries | ✅ done |
 | 8 | Permission & Approval Gates | ⬜ not started |
 | 9 | Tracing & Evals | ⬜ not started |
 | 10 | Adaptive Orchestration | ⬜ not started |
