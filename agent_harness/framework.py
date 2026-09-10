@@ -1,13 +1,8 @@
 """The Agent Harness: composes Modules 2-9 into one runnable agent loop,
-driven by the model provider's native tool-calling instead of a hand-rolled
-JSON action schema (see agent_harness/schemas/tool_calling.py for why).
+driven by native tool-calling (see agent_harness/schemas/tool_calling.py).
 
-Nothing here is new logic -- it's wiring. The model is a normal multi-turn
-chat participant: each turn it either requests one or more tool calls
-(provider-validated against each tool's schema) or replies with plain text,
-which the harness treats as the final answer. The real `messages` list --
-with tool results threaded back by `tool_call_id` -- *is* the working
-memory; there's no separate paraphrased memory log to keep in sync with it.
+Nothing here is new logic -- it's wiring. The `messages` list, threaded by
+`tool_call_id`, is the working memory; there's no separate memory log.
 """
 
 from __future__ import annotations

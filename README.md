@@ -55,5 +55,6 @@ CI (`.github/workflows/ci.yml`) runs all four on every push to `main`.
 | 9 | Tracing & Evals | ✅ done |
 | 10 | Adaptive Orchestration | ✅ done |
 
-See `docs/agent_harness_roadmap.md` for the full architecture, per-module
-concepts, boilerplate, failure modes, and verification tests.
+See `docs/agent_harness_roadmap.md` for the architecture: a single
+end-to-end flow diagram, a per-module reference, and the key design
+decisions behind it.

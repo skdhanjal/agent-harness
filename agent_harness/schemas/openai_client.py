@@ -32,13 +32,8 @@ class OpenAIChatClient:
     def create_completion(
         self, messages: list[dict[str, str]], tools: list[dict[str, object]]
     ) -> str:
-        # Tool schemas are surfaced as prompt text, not the native `tools=`
-        # kwarg: handing them to the API's real function-calling machinery
-        # makes the model respond in that format (e.g. tool_name comes back
-        # prefixed "functions.", or action_type drifts to an invalid value
-        # like "multi_tool_use.parallel") instead of the harness's own
-        # AgentAction JSON contract, and it also biases the model to keep
-        # invoking a tool even after the task is already done.
+        # tools are described as prompt text, not passed to the API's native
+        # tool-calling -- mixing that with forced JSON mode corrupts output.
         prepared = list(messages)
         if tools:
             tool_text = (
@@ -61,10 +56,8 @@ class OpenAIChatClient:
     def create_action_turn(
         self, messages: list[dict[str, object]], tools: list[dict[str, object]]
     ) -> ChatTurn:
-        """One native tool-calling turn: no forced JSON-object mode here --
-        the model replies as a normal chat participant, either requesting
-        tool calls (validated by the API against each tool's schema) or
-        writing a plain-text final answer.
+        """One native tool-calling turn: no forced JSON mode, so the model
+        can reply with tool calls or plain text.
         """
         typed_messages = cast(list[ChatCompletionMessageParam], messages)
         if tools:
@@ -78,9 +71,7 @@ class OpenAIChatClient:
             )
 
         message = response.choices[0].message
-        # ToolRegistry.schema_for_llm() only ever emits `{"type": "function", ...}`
-        # tools, so a "custom" tool call is never expected here -- narrow to the
-        # function-call variant instead of widening ToolCallRequest to cover it.
+        # only "function" tools are ever registered, so narrow to that variant
         tool_calls = [
             ToolCallRequest(
                 id=call.id,

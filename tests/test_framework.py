@@ -49,7 +49,7 @@ def test_harness_runs_tool_call_then_final_answer(tmp_path: Path) -> None:
     )
 
     tools = ToolRegistry()
-    register_filesystem_tools(tools)
+    register_filesystem_tools(tools, root=tmp_path)
 
     ledger = TraceLedger(tmp_path / "traces.jsonl")
     gate = ApprovalGate(approver=lambda action: True)  # auto-approve, no blocking input()
@@ -109,7 +109,7 @@ def test_harness_respects_denied_approval(tmp_path: Path) -> None:
     )
 
     tools = ToolRegistry()
-    register_filesystem_tools(tools)
+    register_filesystem_tools(tools, root=tmp_path)
 
     gate = ApprovalGate(approver=lambda action: False)  # deny everything
 

@@ -1,12 +1,6 @@
-"""Native tool-calling contract: the provider's own structured tool_calls,
-not a hand-rolled JSON action schema (contrast with Module 1's
-`generate_structured`, which asks the model to produce text matching a
-schema and repairs it on failure after the fact).
-
-Tool selection here is validated by the provider *at generation time* --
-the model returns either one or more tool calls (each already parsed,
-named, and id-tagged) or a plain-text final answer, never an ambiguous
-blob of both squeezed into one JSON object.
+"""Native tool-calling contract: the provider validates tool selection at
+generation time, instead of the model writing JSON against a hand-rolled
+schema (contrast with Module 1's `generate_structured`).
 """
 
 from __future__ import annotations
