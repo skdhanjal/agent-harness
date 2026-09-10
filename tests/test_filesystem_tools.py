@@ -118,6 +118,34 @@ def test_grep_files_regex_and_case_insensitive(registry: ToolRegistry) -> None:
     assert result.result[0]["text"] == "Error: boom"  # type: ignore[index]
 
 
+def test_grep_files_rejects_max_matches_below_one(registry: ToolRegistry) -> None:
+    registry.execute("write_file", {"path": "a.txt", "content": "hello"})
+
+    result = registry.execute("grep_files", {"pattern": "hello", "max_matches": 0})
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "max_matches" in result.error
+
+
+def test_grep_files_accepts_a_single_file_as_directory(registry: ToolRegistry) -> None:
+    registry.execute("write_file", {"path": "a.txt", "content": "hello world"})
+    registry.execute("write_file", {"path": "b.txt", "content": "hello again"})
+
+    result = registry.execute("grep_files", {"pattern": "hello", "directory": "a.txt"})
+
+    assert result.ok is True
+    assert len(result.result) == 1  # type: ignore[arg-type]
+    assert result.result[0]["path"] == "a.txt"  # type: ignore[index]
+
+
+def test_grep_files_missing_path_returns_empty_list(registry: ToolRegistry) -> None:
+    result = registry.execute("grep_files", {"pattern": "hello", "directory": "does_not_exist"})
+
+    assert result.ok is True
+    assert result.result == []
+
+
 def test_delete_file_removes_file(registry: ToolRegistry, tmp_path: Path) -> None:
     registry.execute("write_file", {"path": "gone.txt", "content": "x"})
 
@@ -173,14 +201,15 @@ def test_make_directory_creates_nested_dirs(registry: ToolRegistry, tmp_path: Pa
 
 
 def test_file_stat_reports_metadata(registry: ToolRegistry) -> None:
-    registry.execute("write_file", {"path": "a.txt", "content": "hello"})
+    registry.execute("write_file", {"path": "a.txt", "content": "line1\nline2\nline3"})
 
     result = registry.execute("file_stat", {"path": "a.txt"})
 
     assert result.ok is True
     assert result.result["exists"] is True  # type: ignore[index]
     assert result.result["is_file"] is True  # type: ignore[index]
-    assert result.result["size_bytes"] == 5  # type: ignore[index]
+    assert result.result["size_bytes"] == 17  # type: ignore[index]
+    assert result.result["line_count"] == 3  # type: ignore[index]
 
 
 def test_file_stat_missing_path_is_not_an_error(registry: ToolRegistry) -> None:
@@ -188,6 +217,28 @@ def test_file_stat_missing_path_is_not_an_error(registry: ToolRegistry) -> None:
 
     assert result.ok is True
     assert result.result == {"exists": False, "path": "nope.txt"}
+
+
+def test_file_stat_line_count_none_for_directory(registry: ToolRegistry) -> None:
+    registry.execute("make_directory", {"path": "a_dir"})
+
+    result = registry.execute("file_stat", {"path": "a_dir"})
+
+    assert result.ok is True
+    assert result.result["is_dir"] is True  # type: ignore[index]
+    assert result.result["line_count"] is None  # type: ignore[index]
+
+
+def test_file_stat_line_count_none_for_undecodable_file(
+    registry: ToolRegistry, tmp_path: Path
+) -> None:
+    (tmp_path / "binary.dat").write_bytes(b"\xff\xfe\x00\x01\x02")
+
+    result = registry.execute("file_stat", {"path": "binary.dat"})
+
+    assert result.ok is True
+    assert result.result["exists"] is True  # type: ignore[index]
+    assert result.result["line_count"] is None  # type: ignore[index]
 
 
 def test_sandbox_blocks_relative_traversal_escape(registry: ToolRegistry, tmp_path: Path) -> None:

@@ -80,18 +80,27 @@ def register_filesystem_tools(registry: ToolRegistry, root: str | Path = ".") ->
         max_matches: int = 200,
     ) -> list[dict[str, object]]:
         """Search file contents under `directory` (recursively, default:
-        sandbox root) for `pattern`. Substring match by default; `regex=True`
+        sandbox root) for `pattern`. `directory` may also be a single file,
+        to search just that file. Substring match by default; `regex=True`
         treats it as a regular expression. Skips files that can't be decoded
-        as text. Returns up to `max_matches` {"path", "line", "text"} dicts.
+        as text. `max_matches` must be >= 1. Returns up to `max_matches`
+        {"path", "line", "text"} dicts.
         """
+        if max_matches < 1:
+            raise ValueError(f"max_matches must be >= 1, got {max_matches}")
+
         base = sandbox.resolve(directory)
-        if not base.is_dir():
+        if base.is_file():
+            candidates: list[Path] = [base]
+        elif base.is_dir():
+            candidates = sorted(base.rglob("*"))
+        else:
             return []
         matcher = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE) if regex else None
         needle = pattern if case_sensitive else pattern.lower()
 
         matches: list[dict[str, object]] = []
-        for file_path in sorted(base.rglob("*")):
+        for file_path in candidates:
             if len(matches) >= max_matches:
                 break
             if not file_path.is_file() or not sandbox.contains(file_path.resolve()):
@@ -117,14 +126,22 @@ def register_filesystem_tools(registry: ToolRegistry, root: str | Path = ".") ->
 
     @registry.tool
     def file_stat(path: str) -> dict[str, object]:
-        """Metadata for `path` without reading its contents. Returns
-        {"exists": False, "path": path} if nothing is there. Otherwise
-        includes 'is_file', 'is_dir', 'size_bytes', 'modified_at' (UTC).
+        """Metadata for `path`. Returns {"exists": False, "path": path} if
+        nothing is there. Otherwise includes 'is_file', 'is_dir',
+        'size_bytes', 'modified_at' (UTC), and for files, 'line_count'
+        (None if the file can't be decoded as text) -- use this instead of
+        counting lines yourself from read_file's output.
         """
         target = sandbox.resolve(path)
         if not target.exists():
             return {"exists": False, "path": path}
         st = target.stat()
+        line_count: int | None = None
+        if target.is_file():
+            try:
+                line_count = len(target.read_text().splitlines())
+            except (UnicodeDecodeError, OSError):
+                line_count = None
         return {
             "exists": True,
             "path": path,
@@ -132,6 +149,7 @@ def register_filesystem_tools(registry: ToolRegistry, root: str | Path = ".") ->
             "is_dir": target.is_dir(),
             "size_bytes": st.st_size,
             "modified_at": datetime.fromtimestamp(st.st_mtime, tz=UTC).isoformat(),
+            "line_count": line_count,
         }
 
     @registry.tool
