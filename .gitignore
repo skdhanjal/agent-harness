@@ -220,4 +220,5 @@ __marimo__/
 # agent-harness project-specific
 traces.jsonl
 checkpoints/
+run_output/
 CLAUDE.md
