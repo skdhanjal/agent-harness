@@ -1,11 +1,13 @@
 """Integration test for AgentHarness: proves the wiring around native
 tool-calling holds together -- tool execution, approval gating,
-checkpointing, tool_call_id threading, and final-answer handling.
+checkpointing, tool_call_id threading, final-answer handling, and
+context compaction once the running message list exceeds its token budget.
 
 Uses a scripted fake ToolCallingChatClient -- no real API calls -- so the
 loop is verified deterministically.
 """
 
+import json
 from pathlib import Path
 
 from agent_harness.framework import AgentHarness
@@ -132,3 +134,73 @@ def test_harness_respects_denied_approval(tmp_path: Path) -> None:
     tool_msg = client.calls[1][-1]
     assert tool_msg["tool_call_id"] == "call_1"
     assert "DENIED" in str(tool_msg["content"])
+
+
+def test_harness_compacts_context_once_over_budget(tmp_path: Path) -> None:
+    """3 tool-call turns with a token budget of 1 (always exceeded) forces
+    compaction as soon as there's more than `keep_recent_turns` (2) turns
+    to work with -- i.e. right after the 3rd turn is appended.
+    """
+
+    def write_call(call_id: str, n: int) -> ToolCallRequest:
+        return ToolCallRequest(
+            id=call_id,
+            name="write_file",
+            arguments={"path": (tmp_path / f"note{n}.md").as_posix(), "content": f"note {n}"},
+        )
+
+    client = ScriptedToolCallingClient(
+        [
+            ChatTurn(content=None, tool_calls=[write_call("call_1", 1)]),
+            ChatTurn(content=None, tool_calls=[write_call("call_2", 2)]),
+            ChatTurn(content=None, tool_calls=[write_call("call_3", 3)]),
+            ChatTurn(content="condensed summary of the first write", tool_calls=[]),
+            ChatTurn(content="All notes saved.", tool_calls=[]),
+        ]
+    )
+
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+    traces_path = tmp_path / "traces.jsonl"
+
+    harness = AgentHarness(
+        client=client,
+        tools=tools,
+        gate=ApprovalGate(approver=lambda action: True),
+        ledger=TraceLedger(traces_path),
+        run_id="test-run-compaction",
+        instructions="Write three notes.",
+        risk_by_tool={"write_file": RiskTier.HIGH},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        max_iterations=10,
+        context_token_budget=1,  # any non-empty history exceeds this
+    )
+
+    result = harness.run("write three notes")
+
+    assert result == "All notes saved."
+    # 3 action calls + 1 summarize call + 1 final action call
+    assert len(client.calls) == 5
+
+    # the summarize call received exactly the stale (oldest) turn: call_1's
+    # assistant message and its tool result, nothing from turns 2 or 3
+    summarize_messages = client.calls[3]
+    assert summarize_messages[0]["role"] == "system"
+    stale_turn = json.loads(str(summarize_messages[1]["content"]))
+    assert [m["role"] for m in stale_turn] == ["assistant", "tool"]
+    assert stale_turn[0]["tool_calls"][0]["id"] == "call_1"
+    assert stale_turn[1]["tool_call_id"] == "call_1"
+
+    # the final action call's history has the summary in place of turn 1,
+    # and turns 2-3 kept verbatim with their tool_call_ids intact
+    final_messages = client.calls[4]
+    assert "[Summary of 1 earlier turns]" in str(final_messages[2]["content"])
+    remaining_tool_call_ids = [m["tool_call_id"] for m in final_messages if m.get("role") == "tool"]
+    assert remaining_tool_call_ids == ["call_2", "call_3"]
+
+    # compaction is observable in the trace ledger, not silent
+    trace_events = [json.loads(line) for line in traces_path.read_text().splitlines()]
+    compaction_events = [e for e in trace_events if e["event_type"] == "context_compaction"]
+    assert len(compaction_events) == 1
+    payload = compaction_events[0]["payload"]
+    assert payload["tokens_after"] < payload["tokens_before"]

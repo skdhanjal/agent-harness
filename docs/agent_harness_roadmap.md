@@ -42,11 +42,14 @@ flowchart TD
     Approve -- yes --> Exec
     Approve -- no --> Deny["Append DENIED tool result"]
     Exec --> Result["Append tool result\n(role=tool, tool_call_id)"]
-    Deny --> Loop["FSM: → EXECUTE"]
-    Result --> Loop
+    Deny --> Compact{"messages over\ntoken budget?"}
+    Result --> Compact
+    Compact -- no --> Loop["FSM: → EXECUTE"]
+    Compact -- "yes, and >\nkeep_recent_turns" --> Summarize["Summarize oldest turn(s)\ninto one message"]
+    Summarize --> Loop
     Loop --> Guard
 
-    Call -.-> Trace[("TraceLedger:\nllm_call / tool_call /\ngate_decision events")]
+    Call -.-> Trace[("TraceLedger:\nllm_call / tool_call /\ngate_decision /\ncontext_compaction events")]
     Loop -.-> Checkpoint[("Checkpoint:\nphase + step_count")]
 ```
 
@@ -67,6 +70,10 @@ A few things worth reading directly off this diagram:
 - **Tracing and checkpointing are side effects of the loop, not steps in
   it** — they attach after every model call and after every state
   transition, not conditionally.
+- **Context compaction is a budget check on every iteration, not a
+  reaction to failure.** The loop never waits for a context-length error
+  from the API — it counts tokens itself and condenses old turns away
+  before that could happen.
 - **The step budget is a hard ceiling**, not a suggestion: `AgentFSM`'s own
   `max_steps` guard (separate from `max_iterations` here) raises if the FSM
   itself is driven past its limit.
@@ -86,7 +93,10 @@ agent_harness/
 │   ├── filesystem.py       # read/write/list/glob/grep/stat/mkdir/move/delete
 │   └── sandbox.py           # PathSandbox: confines every tool path to a root
 ├── prompts/template.py    # PromptTemplate/PromptRegistry -- built, not yet wired in (see gaps)
-├── context/                # ContextBuilder/count_tokens -- built, not yet wired in (see gaps)
+├── context/
+│   ├── builder.py           # ContextBuilder -- block truncation, built, not yet wired in (see gaps)
+│   ├── tokens.py             # count_tokens, count_messages_tokens
+│   └── compaction.py          # compact_messages: wired into the live loop, see Module 4 below
 ├── control_flow/state_machine.py   # AgentFSM
 ├── memory/
 │   ├── sliding_window.py    # no longer used by the live loop (see Module 6 below)
@@ -146,15 +156,92 @@ in** — the harness's real instructions live as raw f-strings in
 
 Tested in `tests/test_module_03_prompt_ownership.py`.
 
-### 4. Context Construction — `context/builder.py`, `context/tokens.py`
+### 4. Context Construction — `context/builder.py`, `context/tokens.py`, `context/compaction.py`
 
 `ContextBuilder` assembles prioritized text blocks into one budgeted
 string, dropping the lowest-priority blocks whole (never mid-sentence) once
-a token budget is exceeded. **Not currently wired in** — the native
-tool-calling `messages` list has no budget enforcement today, so it grows
-unbounded. See `docs/production_readiness_todo.md`.
+a token budget is exceeded. It's still **not wired into the live loop** —
+it can't be, as-is: the native tool-calling `messages` list has a
+structural constraint independent named blocks don't, an `assistant`
+message with `tool_calls` must be immediately followed by one `tool`
+message per call. Dropping one without the other produces a message list
+the API rejects.
 
-Tested in `tests/test_module_04_context_construction.py`.
+`compact_messages` (`context/compaction.py`) is the loop-specific fix, and
+*is* wired in. `AgentHarness._compact_if_needed` checks
+`count_messages_tokens(messages)` against `context_token_budget` once per
+iteration, right after that iteration's assistant message and tool results
+are appended. Once over budget, it always moves or summarizes a whole
+`(assistant, *tool_results)` turn at a time — never a lone message — so a
+`tool_call_id` is never left orphaned. The system message and original
+task are kept forever; the most recent `keep_recent_turns` (default 2)
+turns are kept verbatim as the model's working context; everything older
+is condensed into one message by a summarization call that reuses the
+harness's own `client.create_action_turn(prompt, tools=[])` — no second
+LLM client dependency. Compaction is logged as a `context_compaction`
+`TraceEvent` (`tokens_before`/`tokens_after`), so it's observable, not
+silent.
+
+**Why this design, and what else was considered:**
+
+- **Why the unit of compaction is a whole turn, not a message.** This is
+  the load-bearing constraint, covered above: the API rejects an
+  `assistant` message whose `tool_calls[].id` has no matching `tool` reply.
+  Any scheme that could drop or move a `tool` message independently of its
+  `assistant` message is disqualified before it's even a design choice.
+- **Why summarize instead of just dropping old turns outright.** Dropping
+  is simpler and cheaper (no LLM call), but it silently destroys
+  information the model may still need — a fact discovered three tool
+  calls ago, a decision already made. Summarizing costs one extra LLM call
+  per compaction event but keeps a compressed trace of what happened,
+  which matches how a person would compress their own memory of a long
+  task rather than just forgetting the first half of it.
+- **Why reuse `self.client` for summarization instead of injecting a
+  second `ChatClient`.** The alternative — add a `summarizer: ChatClient`
+  constructor param, matching Module 1's older `create_completion` protocol
+  — would add a second injectable dependency and a second Protocol for
+  every caller to wire up, just to get plain text back. `create_action_turn`
+  already returns plain text when called with `tools=[]`
+  (`openai_client.py`'s `create_action_turn` skips the `tools=` kwarg
+  entirely in that case), so the existing dependency does the job. One
+  Protocol, one client, less to configure.
+- **Why the summary is inserted as `role: user`, not `role: system` or
+  `role: assistant`.** `assistant` would misattribute authorship — the
+  model never actually said this, and a later confused turn referring back
+  to "what I said" would be reasoning from a fabricated self-quote.
+  `system` is reserved for the one instructions message seeded at the top
+  of `messages`; overloading it mid-conversation blurs the one message the
+  model is trained to weight most heavily as its operating instructions.
+  `user` reads as exactly what it is: contextual information supplied to
+  the model, not by it.
+- **Why the check runs after appending a turn's messages, not before the
+  next model call.** Both would eventually catch an over-budget list, but
+  checking post-append keeps the boundary turn-aligned for free — the
+  turn that just completed is either entirely in or entirely candidate for
+  summarization, never half-appended when the check runs.
+- **Why `context_token_budget` defaults to 8,000.** Deliberately
+  conservative relative to real model context windows (gpt-4o-mini is
+  128K) — the goal is to exercise compaction well before a run is ever at
+  real risk of hitting the model's actual limit, not to squeeze maximum
+  context out of every call. It's a constructor parameter specifically so
+  a caller can raise it for a model with a smaller window or a task that
+  needs more working history verbatim.
+- **What was rejected: reusing `ContextBuilder` directly.** Considered and
+  dropped immediately — see the constraint above. `ContextBuilder` remains
+  a legitimate tool for a different problem (assembling one bounded prompt
+  from independent named sections that have no pairing constraint between
+  them), just not this one.
+
+**Known limitation, not solved here:** if the kept recent turns alone
+exceed the budget (e.g. one huge tool result), this pass can't shrink
+them — turn-pair compaction only ever helps by summarizing *older* turns
+away. Fixing that is a different problem (per-message truncation) than
+this module solves.
+
+Tested in `tests/test_module_04_context_construction.py` (pure
+`compact_messages` unit tests) and `tests/test_framework.py`
+(`test_harness_compacts_context_once_over_budget`, an end-to-end run that
+forces compaction mid-loop).
 
 ### 5. Control-Flow Ownership — `control_flow/state_machine.py`
 
@@ -287,10 +374,10 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail. The two most load-bearing items:
+detail. The most load-bearing item still open:
 
-- **Unbounded context growth** — the `messages` list in the flow diagram
-  has no token-budget check, so a long-running task will eventually exceed
-  the model's context window.
 - **Checkpoint resume doesn't actually work** — `load_checkpoint()` is
   never called anywhere; a crash mid-run currently loses everything.
+
+(Unbounded context growth was the other item in this list; it's now fixed
+— see Module 4 above.)

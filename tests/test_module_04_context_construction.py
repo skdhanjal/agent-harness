@@ -2,12 +2,15 @@
 
 Proves: over-budget blocks are dropped lowest-priority-first, higher
 priority blocks always survive intact, order in the final output follows
-priority (not insertion order), and the real tiktoken-based counter works.
+priority (not insertion order), the real tiktoken-based counter works, and
+turn-pair compaction (the live-loop fix for unbounded `messages` growth)
+summarizes whole turns without ever orphaning a `tool_call_id`.
 """
 
 import pytest
 
 from agent_harness.context.builder import ContextBuilder
+from agent_harness.context.compaction import compact_messages
 from agent_harness.context.tokens import count_tokens
 
 
@@ -74,3 +77,79 @@ def test_count_tokens_uses_real_tokenizer() -> None:
     assert count_tokens("") == 0
     assert baseline > 0
     assert count_tokens("hello world, this is a longer sentence") > baseline
+
+
+def _turn(n: int) -> list[dict[str, object]]:
+    """One assistant+tool_result turn, padded so word_count sees real weight."""
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": f"call_{n}", "type": "function", "function": {"name": "x"}}],
+        },
+        {"role": "tool", "tool_call_id": f"call_{n}", "content": f"result padding {'x ' * n}"},
+    ]
+
+
+def test_compact_messages_returns_unchanged_when_under_budget() -> None:
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    messages += _turn(1) + _turn(2)
+
+    result = compact_messages(
+        messages,
+        token_budget=1000,
+        count_tokens=word_count,
+        summarize=lambda turns: "should not be called",
+    )
+
+    assert result is messages
+
+
+def test_compact_messages_summarizes_stale_turns_and_keeps_recent_verbatim() -> None:
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    turns = [_turn(n) for n in range(1, 6)]  # 5 turns, well over a tiny budget
+    messages += [m for turn in turns for m in turn]
+
+    captured: list[dict[str, object]] = []
+
+    def fake_summarize(stale: list[dict[str, object]]) -> str:
+        captured.extend(stale)
+        return "condensed summary"
+
+    result = compact_messages(
+        messages,
+        token_budget=5,
+        count_tokens=word_count,
+        summarize=fake_summarize,
+        keep_recent_turns=2,
+    )
+
+    # system + task untouched
+    assert result[0] == messages[0]
+    assert result[1] == messages[1]
+    # the 3 oldest turns (6 messages) were handed to summarize, not the 2 recent ones
+    assert captured == turns[0] + turns[1] + turns[2]
+    # replaced by exactly one summary message
+    assert result[2] == {
+        "role": "user",
+        "content": "[Summary of 3 earlier turns]\ncondensed summary",
+    }
+    # the 2 most recent turns survive verbatim, tool_call_id pairing intact
+    assert result[3:] == turns[3] + turns[4]
+
+
+def test_compact_messages_leaves_single_oversized_turn_alone() -> None:
+    """Can't shrink what it can't split: with <= keep_recent_turns turns total,
+    there's nothing older to summarize away, even over budget."""
+    messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+    messages += _turn(1)
+
+    result = compact_messages(
+        messages,
+        token_budget=1,
+        count_tokens=word_count,
+        summarize=lambda turns: "should not be called",
+        keep_recent_turns=2,
+    )
+
+    assert result is messages

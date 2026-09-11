@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from functools import partial
 
+from agent_harness.context.compaction import compact_messages
+from agent_harness.context.tokens import count_messages_tokens, count_tokens
 from agent_harness.control_flow.state_machine import AgentFSM, Phase
 from agent_harness.gates.approval import ApprovalGate, PendingAction, RiskTier
 from agent_harness.persistence.checkpoint import save_checkpoint
@@ -17,6 +19,12 @@ from agent_harness.persistence.retry import with_backoff
 from agent_harness.schemas.tool_calling import ChatTurn, ToolCallingChatClient, ToolCallRequest
 from agent_harness.tools.registry import ToolRegistry
 from agent_harness.tracing.ledger import TraceEvent, TraceLedger
+
+_SUMMARIZE_SYSTEM_PROMPT = (
+    "Summarize this earlier portion of an agent's tool-use history. Preserve "
+    "concrete facts, decisions, and outcomes the agent will still need; drop "
+    "raw tool-call plumbing. Be concise."
+)
 
 
 class MaxIterationsExceededError(RuntimeError):
@@ -35,6 +43,7 @@ class AgentHarness:
         risk_by_tool: dict[str, RiskTier] | None = None,
         max_iterations: int = 5,
         checkpoint_dir: str = "./checkpoints",
+        context_token_budget: int = 8_000,
     ) -> None:
         self.client = client
         self.tools = tools
@@ -45,6 +54,7 @@ class AgentHarness:
         self.risk_by_tool = risk_by_tool or {}
         self.max_iterations = max_iterations
         self.checkpoint_dir = checkpoint_dir
+        self.context_token_budget = context_token_budget
 
         self.fsm = AgentFSM(max_steps=max_iterations * 2)
 
@@ -76,6 +86,8 @@ class AgentHarness:
             messages.append(self._assistant_message(turn))
             for call in turn.tool_calls:
                 messages.append(self._execute_tool_call(call))
+
+            messages = self._compact_if_needed(messages)
 
             self.fsm.step(Phase.EXECUTE)
             self._checkpoint()
@@ -124,6 +136,38 @@ class AgentHarness:
         )
         outcome = result.result if result.ok else f"ERROR: {result.error}"
         return {"role": "tool", "tool_call_id": call.id, "content": str(outcome)}
+
+    def _compact_if_needed(self, messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        tokens_before = count_messages_tokens(messages, count_tokens)
+        if tokens_before <= self.context_token_budget:
+            return messages
+
+        compacted = compact_messages(
+            messages,
+            token_budget=self.context_token_budget,
+            count_tokens=count_tokens,
+            summarize=self._summarize_turns,
+        )
+        if compacted is not messages:
+            self.ledger.log(
+                TraceEvent(
+                    run_id=self.run_id,
+                    event_type="context_compaction",
+                    payload={
+                        "tokens_before": tokens_before,
+                        "tokens_after": count_messages_tokens(compacted, count_tokens),
+                    },
+                )
+            )
+        return compacted
+
+    def _summarize_turns(self, turn_messages: list[dict[str, object]]) -> str:
+        prompt: list[dict[str, object]] = [
+            {"role": "system", "content": _SUMMARIZE_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(turn_messages)},
+        ]
+        turn = self.client.create_action_turn(prompt, [])
+        return turn.content or ""
 
     def _checkpoint(self) -> None:
         save_checkpoint(
