@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 from functools import partial
+from typing import cast
 
 from agent_harness.context.compaction import compact_messages
 from agent_harness.context.tokens import count_messages_tokens, count_tokens
 from agent_harness.control_flow.state_machine import AgentFSM, Phase
 from agent_harness.gates.approval import ApprovalGate, PendingAction, RiskTier
-from agent_harness.persistence.checkpoint import save_checkpoint
+from agent_harness.persistence.checkpoint import load_checkpoint, save_checkpoint
 from agent_harness.persistence.retry import with_backoff
 from agent_harness.schemas.tool_calling import ChatTurn, ToolCallingChatClient, ToolCallRequest
 from agent_harness.tools.registry import ToolRegistry
@@ -26,9 +27,19 @@ _SUMMARIZE_SYSTEM_PROMPT = (
     "raw tool-call plumbing. Be concise."
 )
 
+_TERMINAL_PHASES = frozenset({Phase.DONE, Phase.FAILED})
+
 
 class MaxIterationsExceededError(RuntimeError):
     """Raised when the agent never produces a final answer within budget."""
+
+
+class CheckpointNotFoundError(RuntimeError):
+    """Raised by resume() when run_id has no checkpoint to resume from."""
+
+
+class RunAlreadyFinishedError(RuntimeError):
+    """Raised by resume() when the checkpoint's phase is already terminal."""
 
 
 class AgentHarness:
@@ -64,6 +75,25 @@ class AgentHarness:
             {"role": "system", "content": self.instructions},
             {"role": "user", "content": task},
         ]
+        return self._run_loop(messages)
+
+    def resume(self) -> str:
+        """Continue a run from its last checkpoint -- reads state from disk,
+        since the caller is typically a new process, not the one that crashed."""
+        checkpoint = load_checkpoint(self.run_id, directory=self.checkpoint_dir)
+        if checkpoint is None:
+            raise CheckpointNotFoundError(f"no checkpoint found for run_id={self.run_id!r}")
+
+        phase = Phase[str(checkpoint["phase"])]
+        if phase in _TERMINAL_PHASES:
+            raise RunAlreadyFinishedError(f"run_id={self.run_id!r} already reached {phase.name}")
+
+        self.fsm.phase = phase
+        self.fsm.step_count = cast(int, checkpoint["step_count"])
+        messages = cast(list[dict[str, object]], checkpoint["messages"])
+        return self._run_loop(messages)
+
+    def _run_loop(self, messages: list[dict[str, object]]) -> str:
         tools_schema = self.tools.schema_for_llm()
 
         for _ in range(self.max_iterations):
@@ -75,12 +105,12 @@ class AgentHarness:
                     payload={"content": turn.content, "num_tool_calls": len(turn.tool_calls)},
                 )
             )
-            self._checkpoint()
+            self._checkpoint(messages)
 
             if not turn.tool_calls:
                 self.fsm.step(Phase.REVIEW)
                 self.fsm.step(Phase.DONE)
-                self._checkpoint()
+                self._checkpoint(messages)
                 return turn.content or ""
 
             messages.append(self._assistant_message(turn))
@@ -90,7 +120,7 @@ class AgentHarness:
             messages = self._compact_if_needed(messages)
 
             self.fsm.step(Phase.EXECUTE)
-            self._checkpoint()
+            self._checkpoint(messages)
 
         raise MaxIterationsExceededError(f"No final answer within {self.max_iterations} iterations")
 
@@ -169,9 +199,13 @@ class AgentHarness:
         turn = self.client.create_action_turn(prompt, [])
         return turn.content or ""
 
-    def _checkpoint(self) -> None:
+    def _checkpoint(self, messages: list[dict[str, object]]) -> None:
         save_checkpoint(
             self.run_id,
-            {"phase": self.fsm.phase.name, "step_count": self.fsm.step_count},
+            {
+                "phase": self.fsm.phase.name,
+                "step_count": self.fsm.step_count,
+                "messages": messages,
+            },
             directory=self.checkpoint_dir,
         )

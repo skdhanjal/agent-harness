@@ -50,7 +50,7 @@ flowchart TD
     Loop --> Guard
 
     Call -.-> Trace[("TraceLedger:\nllm_call / tool_call /\ngate_decision /\ncontext_compaction events")]
-    Loop -.-> Checkpoint[("Checkpoint:\nphase + step_count")]
+    Loop -.-> Checkpoint[("Checkpoint:\nphase + step_count + messages")]
 ```
 
 A few things worth reading directly off this diagram:
@@ -272,12 +272,56 @@ Tested in `tests/test_module_06_memory.py`.
 `with_backoff()` wraps every model call with exponential backoff + jitter,
 re-raising immediately on `FatalError` instead of retrying it — though
 nothing in production code raises `FatalError` today, so a bad API key
-currently gets retried like any transient failure. `save_checkpoint()` runs
-after every step in the diagram above, but only records `{phase,
-step_count}` — `load_checkpoint()` exists but nothing calls it, so a crash
-mid-run can't actually resume yet. See `docs/production_readiness_todo.md`.
+currently gets retried like any transient failure. See
+`docs/production_readiness_todo.md`.
 
-Tested in `tests/test_module_07_checkpointing.py`.
+`save_checkpoint()` (via `AgentHarness._checkpoint`) now writes `{phase,
+step_count, messages}` after every step in the diagram above, and
+`AgentHarness.resume()` is the counterpart that actually uses
+`load_checkpoint()`: it loads that state for `self.run_id`, restores
+`AgentFSM.phase`/`step_count` by direct field assignment (the FSM is a
+plain mutable dataclass, `control_flow/state_machine.py:43`), and re-enters
+the same `_run_loop` that `run()` uses — one loop implementation, two ways
+to seed it. Two calls it can raise instead of silently doing the wrong
+thing: `CheckpointNotFoundError` (no checkpoint for this `run_id`) and
+`RunAlreadyFinishedError` (checkpoint's phase is already `DONE`/`FAILED` —
+Module 5's own terminal states, so there's nothing left to continue).
+
+**Why this design:**
+
+- **`messages` lives inline in the checkpoint JSON, not a sidecar file.**
+  One file, one write, no two files to keep in sync. This only stays cheap
+  because Module 4's compaction (above) already bounds how large `messages`
+  can grow — the two fixes compose.
+- **`resume()` takes no arguments and always reads from disk, never trusts
+  `self.fsm` in memory.** The real caller is a brand-new `AgentHarness` in a
+  new process after a crash — its own `self.fsm` starts at `PLAN`/`0` and
+  has never seen the pre-crash state, so there's nothing in memory worth
+  trusting.
+- **One shared `_run_loop`, not two copies of the model-call loop.** `run()`
+  seeds `messages` from `[system, user(task)]` and does the mandatory
+  `PLAN → EXECUTE` transition; `resume()` seeds `messages` and FSM state
+  from the checkpoint instead. Both then call the same loop. Two copies of
+  the loop body would drift the moment one of them changed without the
+  other.
+- **No migration path for checkpoints written before this change.**
+  Checkpoints are ephemeral per-run scratch state, not a versioned public
+  format — an old checkpoint missing the `"messages"` key just can't be
+  resumed, and nothing tries to paper over that.
+- **The resumed segment gets a fresh `max_iterations` model-call budget,
+  but the FSM's `step_count` ceiling (restored from the checkpoint) is the
+  real cross-process hard limit.** If a run crashes after 3 of 5
+  iterations and resumes, the resumed segment can make up to 5 more model
+  calls — but `AgentFSM`'s own `max_steps` guard, continuing from the
+  pre-crash `step_count`, still raises `StepLimitExceededError` once the
+  *original* total ceiling is hit. Two guards, two different jobs: one
+  paces a single process's model calls, the other is the absolute ceiling
+  that survives a crash.
+
+Tested in `tests/test_module_07_checkpointing.py` (checkpoint round-trip
+in isolation) and `tests/test_framework.py`
+(`test_harness_resumes_from_checkpoint_after_crash` and the two
+`test_resume_raises_*` tests for the not-found / already-finished cases).
 
 ### 8. Permission & Approval Gates — `gates/approval.py`
 
@@ -374,10 +418,9 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail. The most load-bearing item still open:
+detail; see it for what's still open (cost/token tracking, approval-gate
+crash durability, retry policy, and further down the priority list).
 
-- **Checkpoint resume doesn't actually work** — `load_checkpoint()` is
-  never called anywhere; a crash mid-run currently loses everything.
-
-(Unbounded context growth was the other item in this list; it's now fixed
-— see Module 4 above.)
+(Unbounded context growth and checkpoint resume were the two most
+load-bearing items in this list; both are now fixed — see Module 4 and
+Module 7 above.)

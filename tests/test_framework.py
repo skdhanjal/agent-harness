@@ -1,7 +1,8 @@
 """Integration test for AgentHarness: proves the wiring around native
 tool-calling holds together -- tool execution, approval gating,
-checkpointing, tool_call_id threading, final-answer handling, and
-context compaction once the running message list exceeds its token budget.
+checkpointing, tool_call_id threading, final-answer handling, context
+compaction once the running message list exceeds its token budget, and
+crash resume from the last checkpoint.
 
 Uses a scripted fake ToolCallingChatClient -- no real API calls -- so the
 loop is verified deterministically.
@@ -10,9 +11,16 @@ loop is verified deterministically.
 import json
 from pathlib import Path
 
-from agent_harness.framework import AgentHarness
+import pytest
+
+from agent_harness.framework import (
+    AgentHarness,
+    CheckpointNotFoundError,
+    RunAlreadyFinishedError,
+)
 from agent_harness.gates.approval import ApprovalGate, RiskTier
 from agent_harness.persistence.checkpoint import load_checkpoint
+from agent_harness.persistence.retry import FatalError
 from agent_harness.schemas.tool_calling import ChatTurn, ToolCallRequest
 from agent_harness.tools.filesystem import register_filesystem_tools
 from agent_harness.tools.registry import ToolRegistry
@@ -20,7 +28,7 @@ from agent_harness.tracing.ledger import TraceLedger
 
 
 class ScriptedToolCallingClient:
-    def __init__(self, turns: list[ChatTurn]) -> None:
+    def __init__(self, turns: list[ChatTurn | Exception]) -> None:
         self._turns = turns
         self.calls: list[list[dict[str, object]]] = []
 
@@ -28,7 +36,10 @@ class ScriptedToolCallingClient:
         self, messages: list[dict[str, object]], tools: list[dict[str, object]]
     ) -> ChatTurn:
         self.calls.append(list(messages))
-        return self._turns[len(self.calls) - 1]
+        turn = self._turns[len(self.calls) - 1]
+        if isinstance(turn, Exception):
+            raise turn
+        return turn
 
 
 def test_harness_runs_tool_call_then_final_answer(tmp_path: Path) -> None:
@@ -204,3 +215,96 @@ def test_harness_compacts_context_once_over_budget(tmp_path: Path) -> None:
     assert len(compaction_events) == 1
     payload = compaction_events[0]["payload"]
     assert payload["tokens_after"] < payload["tokens_before"]
+
+
+def test_harness_resumes_from_checkpoint_after_crash(tmp_path: Path) -> None:
+    """A FatalError mid-run (not retried by with_backoff) simulates a crash.
+    A fresh AgentHarness -- same run_id, same checkpoint_dir -- then resumes
+    without re-executing the tool call that already ran before the crash.
+    """
+    note_path = tmp_path / "note.md"
+    checkpoint_dir = tmp_path / "checkpoints"
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+
+    def make_harness(client: ScriptedToolCallingClient) -> AgentHarness:
+        return AgentHarness(
+            client=client,
+            tools=tools,
+            gate=ApprovalGate(approver=lambda action: True),
+            ledger=TraceLedger(tmp_path / "traces.jsonl"),
+            run_id="resume-run",
+            instructions="Write a note and save it.",
+            risk_by_tool={"write_file": RiskTier.HIGH},
+            checkpoint_dir=str(checkpoint_dir),
+        )
+
+    crashing_client = ScriptedToolCallingClient(
+        [
+            ChatTurn(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="write_file",
+                        arguments={"path": note_path.as_posix(), "content": "hello"},
+                    )
+                ],
+            ),
+            FatalError("simulated crash"),
+        ]
+    )
+    with pytest.raises(FatalError):
+        make_harness(crashing_client).run("write a note")
+
+    resumed_client = ScriptedToolCallingClient([ChatTurn(content="Saved the note.", tool_calls=[])])
+    result = make_harness(resumed_client).resume()
+
+    assert result == "Saved the note."
+    assert note_path.read_text() == "hello"
+    assert len(resumed_client.calls) == 1  # only the post-crash call was needed
+
+    resumed_messages = resumed_client.calls[0]
+    assert resumed_messages[-2]["role"] == "assistant"
+    assert resumed_messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": f"wrote 5 chars to {note_path.as_posix()}",
+    }
+
+
+def test_resume_raises_when_no_checkpoint_exists(tmp_path: Path) -> None:
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+    harness = AgentHarness(
+        client=ScriptedToolCallingClient([]),
+        tools=tools,
+        gate=ApprovalGate(approver=lambda action: True),
+        ledger=TraceLedger(tmp_path / "traces.jsonl"),
+        run_id="never-ran",
+        instructions="x",
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
+
+    with pytest.raises(CheckpointNotFoundError):
+        harness.resume()
+
+
+def test_resume_raises_when_run_already_finished(tmp_path: Path) -> None:
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+    checkpoint_dir = str(tmp_path / "checkpoints")
+    client = ScriptedToolCallingClient([ChatTurn(content="All done.", tool_calls=[])])
+    harness = AgentHarness(
+        client=client,
+        tools=tools,
+        gate=ApprovalGate(approver=lambda action: True),
+        ledger=TraceLedger(tmp_path / "traces.jsonl"),
+        run_id="finished-run",
+        instructions="x",
+        checkpoint_dir=checkpoint_dir,
+    )
+    harness.run("a task")
+
+    with pytest.raises(RunAlreadyFinishedError):
+        harness.resume()
