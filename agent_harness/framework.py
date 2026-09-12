@@ -103,6 +103,9 @@ class AgentHarness:
                     run_id=self.run_id,
                     event_type="llm_call",
                     payload={"content": turn.content, "num_tool_calls": len(turn.tool_calls)},
+                    tokens_in=turn.tokens_in,
+                    tokens_out=turn.tokens_out,
+                    cost_usd=turn.cost_usd,
                 )
             )
             self._checkpoint(messages)

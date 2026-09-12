@@ -337,13 +337,45 @@ Tested in `tests/test_module_08_approval_gates.py`.
 ### 9. Tracing & Evals — `tracing/`
 
 `TraceLedger` appends one JSON line per `llm_call`/`tool_call`/
-`gate_decision` event, and `total_cost()` sums `cost_usd` across a run's
-events. In production that sum is always `0.0` today — nothing populates
-`cost_usd`/`tokens_in`/`tokens_out` from the real API response yet. See
-`docs/production_readiness_todo.md`. `LLMJudge` scores a finished
+`gate_decision`/`context_compaction` event, and `total_cost()` sums
+`cost_usd` across a run's events. `ChatTurn` (`schemas/tool_calling.py`)
+carries `tokens_in`/`tokens_out`/`cost_usd`; `OpenAIChatClient.create_action_turn`
+populates them from the real `response.usage` and a small per-model USD
+price table, and `AgentHarness._run_loop` copies all three onto every
+`llm_call` `TraceEvent` it logs — so `total_cost()` now sums real numbers
+for a real run instead of always `0.0`. `LLMJudge` scores a finished
 trajectory against a rubric, reusing `generate_structured` from Module 1.
 
-Tested in `tests/test_module_09_tracing_evals.py`.
+**Why this design:**
+
+- **The price table lives in `openai_client.py`, not a shared `tracing`
+  module.** Per-token USD pricing is a fact about the *provider*, not about
+  tracing in general — the same reason `openai_client.py` is the only file
+  that imports the `openai` SDK. Putting it in `tracing/` would also invert
+  the module dependency graph above (M1 → M9, never the reverse); keeping it
+  in `schemas/openai_client.py` means M9 stays a pure consumer of whatever
+  numbers `ChatTurn` already carries, with zero awareness of how they were
+  priced.
+- **Unrecognized models fall back to `gpt-4o-mini`'s rate instead of
+  raising.** A live run's cost estimate being slightly off for a brand-new
+  model is a rounding error; raising mid-run over a pricing-table miss would
+  turn an observability gap into an availability one, which is a worse
+  trade.
+- **`create_completion` (the older Module 1 `ChatClient` protocol, used by
+  `generate_structured` and `LLMJudge`) deliberately wasn't touched.** Its
+  contract returns a plain `str`, and neither of its callers ever logs a
+  `TraceEvent` — there's nowhere for a `tokens_in`/`cost_usd` it captured to
+  actually go yet. Widening that Protocol's return type would ripple through
+  every caller and test fake for a value nothing downstream reads. If
+  Module 1 call sites ever get their own tracing, that's the point to
+  revisit this, not before.
+
+Tested in `tests/test_openai_client.py` (usage capture and cost math against
+a mocked SDK response, including the missing-`usage` and unpriced-model
+fallbacks) and `tests/test_module_09_tracing_evals.py` (ledger/judge unit
+tests) and `tests/test_framework.py`
+(`test_harness_records_token_usage_and_cost_from_chat_turn`, proving the
+harness threads a turn's numbers through to the ledger unchanged).
 
 ### 10. Adaptive Orchestration — `orchestration/`
 
@@ -418,9 +450,9 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail; see it for what's still open (cost/token tracking, approval-gate
-crash durability, retry policy, and further down the priority list).
+detail; see it for what's still open (approval-gate crash durability, retry
+policy, and further down the priority list).
 
-(Unbounded context growth and checkpoint resume were the two most
-load-bearing items in this list; both are now fixed — see Module 4 and
-Module 7 above.)
+(Unbounded context growth, checkpoint resume, and cost/token tracking were
+the most load-bearing items in this list; all three are now fixed — see
+Module 4, Module 7, and Module 9 above.)

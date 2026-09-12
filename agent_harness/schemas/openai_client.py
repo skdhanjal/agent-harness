@@ -23,11 +23,25 @@ from agent_harness.schemas.tool_calling import ChatTurn, ToolCallRequest
 
 load_dotenv()
 
+# USD per 1M tokens, (input, output) -- OpenAI's published prices at write
+# time. Unrecognized models fall back to gpt-4o-mini's rate rather than
+# raising, since a cost estimate is better than crashing a live run over it.
+_PRICE_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+}
+
 
 class OpenAIChatClient:
     def __init__(self, model: str = "gpt-4o-mini") -> None:
         self._client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         self._model = model
+
+    def _cost_usd(self, tokens_in: int, tokens_out: int) -> float:
+        input_price, output_price = _PRICE_PER_MILLION_TOKENS.get(
+            self._model, _PRICE_PER_MILLION_TOKENS["gpt-4o-mini"]
+        )
+        return (tokens_in * input_price + tokens_out * output_price) / 1_000_000
 
     def create_completion(
         self, messages: list[dict[str, str]], tools: list[dict[str, object]]
@@ -81,4 +95,12 @@ class OpenAIChatClient:
             for call in message.tool_calls or []
             if isinstance(call, ChatCompletionMessageFunctionToolCall)
         ]
-        return ChatTurn(content=message.content, tool_calls=tool_calls)
+        tokens_in = response.usage.prompt_tokens if response.usage else 0
+        tokens_out = response.usage.completion_tokens if response.usage else 0
+        return ChatTurn(
+            content=message.content,
+            tool_calls=tool_calls,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=self._cost_usd(tokens_in, tokens_out),
+        )

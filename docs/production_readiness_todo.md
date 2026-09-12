@@ -37,23 +37,26 @@ Module 7 section. Tested in `tests/test_framework.py`
 (`test_harness_resumes_from_checkpoint_after_crash` and the two
 `test_resume_raises_*` cases).
 
+### Cost/token tracking is always zero — fixed
+`ChatTurn` (`agent_harness/schemas/tool_calling.py`) now carries
+`tokens_in`/`tokens_out`/`cost_usd`, populated by
+`OpenAIChatClient.create_action_turn` from the real `response.usage` and a
+small per-model price table, and `AgentHarness._run_loop` threads all three
+onto every `llm_call` `TraceEvent` it logs. `TraceLedger.total_cost()` now
+sums real numbers for a real run instead of always `0.0`. Full design
+rationale — why the pricing table lives in `openai_client.py` instead of a
+shared `tracing` module, why `create_completion` (the older Module 1
+protocol) was deliberately left out of this fix, and the fallback behavior
+for an unpriced model or a missing `usage` field — is written up in
+`docs/agent_harness_roadmap.md`'s Module 9 section, not duplicated here.
+Tested in `tests/test_openai_client.py` (usage capture and cost math against
+a mocked SDK response) and `tests/test_framework.py`
+(`test_harness_records_token_usage_and_cost_from_chat_turn`, proving the
+harness threads a turn's numbers through to the ledger unchanged).
+
 ## High (core production gaps)
 
-### 1. Cost/token tracking is always zero
-`TraceEvent.cost_usd`/`tokens_in`/`tokens_out` (`agent_harness/tracing/ledger.py`)
-default to `0`/`0.0`, and every real `TraceEvent(...)` construction in
-`framework.py` omits them — so in production they're always the defaults.
-The real OpenAI response carries `usage.prompt_tokens`/`completion_tokens`/
-`total_tokens`, currently discarded in `OpenAIChatClient.create_action_turn`/
-`create_completion`. `TraceLedger.total_cost()` sums whatever's on disk, but
-for real runs that sum is always `0.0`. Module 9's whole point — cost
-observability — is decorative in production today.
-
-Fix shape: capture `response.usage` in both `OpenAIChatClient` methods,
-compute cost from a small per-model pricing table, thread both through to the
-`TraceEvent`s `framework.py` already logs.
-
-### 2. Approval gate has no crash durability
+### 1. Approval gate has no crash durability
 `ApprovalGate` (`agent_harness/gates/approval.py`) is purely synchronous —
 `check()` calls the approver inline; the default blocks on `input()`. No
 `PendingAction` is ever persisted, and there's no linkage to checkpointing.
@@ -64,7 +67,7 @@ first as a blocking CLI prompt, later as an async webhook/queue") but the
 there's somewhere to restore a "waiting on approval" state *to* — but nothing
 persists that state as a `PendingAction` in the first place yet.
 
-### 3. Retry policy is too permissive
+### 2. Retry policy is too permissive
 `with_backoff` (`agent_harness/persistence/retry.py`) retries everything
 except `FatalError` with exponential backoff (up to 5 attempts). `FatalError`
 is never raised anywhere in production code — only in a test — so a bad API
@@ -78,7 +81,7 @@ they fail fast instead of retrying.
 
 ## Medium (scale/quality)
 
-### 4. Memory tiers built but unused
+### 3. Memory tiers built but unused
 `DurableStateStore` and `VectorMemory` (`agent_harness/memory/`) are fully
 implemented and independently tested but never imported by `framework.py` or
 `run_agent.py`. `AgentHarness` has no memory-store fields; every run starts
@@ -90,7 +93,7 @@ Fix shape: needs a product decision first — what should actually be
 persisted across runs for *this* harness's use case — before it's worth
 wiring in mechanically.
 
-### 5. Orchestration not composed into a real driver
+### 4. Orchestration not composed into a real driver
 `ModelRouter`/`SubAgentSpawner` (`agent_harness/orchestration/`) are only
 exercised by `tests/test_module_10_orchestration.py`. `AgentHarness.run()`
 has signature `run(self, task: str)` — no `run_id` override — so the
@@ -105,7 +108,7 @@ Fix shape: add an optional `run_id` param to `run()` (falling back to
 to pick a tier per node and `SubAgentSpawner` to run them, each with its own
 trace file.
 
-### 6. Prompts aren't actually versioned
+### 5. Prompts aren't actually versioned
 `PromptTemplate`/`PromptRegistry` (`agent_harness/prompts/template.py`) exist
 and are tested, but the real system/task instructions are raw f-strings
 built inline in `run_agent.py` (see `RISK_BY_TOOL`'s neighboring
@@ -116,44 +119,44 @@ isn't actually achieved outside the module's own tests.
 
 ## Lower priority (hardening/DX)
 
-### 7. Missing capstone integration test
+### 6. Missing capstone integration test
 `docs/agent_harness_roadmap.md`'s closing step describes
 `tests/test_capstone.py`: a multi-step task through a real approval gate and
 forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
 output schema validation, a gapless trace ledger with correct total cost, and
 an `LLMJudge` pass across 3 deterministic runs. This file still doesn't
-exist. Checkpoint resume (above) is done, so that half of the test is now
-actually writable; still blocked on #1 above (non-zero cost tracking) for
-the "gapless trace ledger with correct total cost" assertion.
+exist. Checkpoint resume and cost tracking (both above) are done, so this
+test is now fully writable against real behavior — nothing else on this list
+blocks it anymore.
 
-### 8. No CI coverage-threshold enforcement
+### 7. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 9. No installable CLI / packaging
+### 8. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 10. Single-provider lock-in
+### 9. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 11. `TraceLedger` has no rotation/retention policy
+### 10. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 12. No process-wide concurrency cap across parallel sub-agent runs
+### 11. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process
 or host — the "fork bomb of agents calling agents" failure mode the roadmap
-names for Module 10. Only relevant once #5 has a real multi-agent driver to
+names for Module 10. Only relevant once #4 has a real multi-agent driver to
 run more than one spawner at a time.

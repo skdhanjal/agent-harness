@@ -24,6 +24,9 @@ class ChatTurn:
 
     content: str | None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
 
 
 class ToolCallingChatClient(Protocol):

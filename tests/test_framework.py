@@ -102,6 +102,52 @@ def test_harness_runs_tool_call_then_final_answer(tmp_path: Path) -> None:
     assert checkpoint["phase"] == "DONE"
 
 
+def test_harness_records_token_usage_and_cost_from_chat_turn(tmp_path: Path) -> None:
+    """The harness doesn't compute cost itself -- it just threads whatever
+    the client already measured (real usage from OpenAI, 0 from a fake)
+    through to the ledger, per event.
+    """
+    client = ScriptedToolCallingClient(
+        [
+            ChatTurn(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(id="call_1", name="write_file", arguments={}),
+                ],
+                tokens_in=120,
+                tokens_out=15,
+                cost_usd=0.000027,
+            ),
+            ChatTurn(content="Done.", tool_calls=[], tokens_in=200, tokens_out=5, cost_usd=0.00006),
+        ]
+    )
+
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+    traces_path = tmp_path / "traces.jsonl"
+
+    harness = AgentHarness(
+        client=client,
+        tools=tools,
+        gate=ApprovalGate(approver=lambda action: True),
+        ledger=TraceLedger(traces_path),
+        run_id="test-run-cost",
+        instructions="x",
+        risk_by_tool={"write_file": RiskTier.HIGH},
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+    )
+    # write_file with no path/content is a validation error, which is fine --
+    # only the llm_call trace events (not tool success) are under test here.
+    harness.run("do something")
+
+    trace_events = [json.loads(line) for line in traces_path.read_text().splitlines()]
+    llm_calls = [e for e in trace_events if e["event_type"] == "llm_call"]
+    assert [e["tokens_in"] for e in llm_calls] == [120, 200]
+    assert [e["tokens_out"] for e in llm_calls] == [15, 5]
+    assert llm_calls[0]["cost_usd"] == pytest.approx(0.000027)
+    assert llm_calls[1]["cost_usd"] == pytest.approx(0.00006)
+
+
 def test_harness_respects_denied_approval(tmp_path: Path) -> None:
     denied_path = tmp_path / "x.md"
 
