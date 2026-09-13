@@ -12,16 +12,39 @@ import os
 from typing import cast
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    UnprocessableEntityError,
+)
 from openai.types.chat import (
     ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageParam,
     ChatCompletionToolUnionParam,
 )
 
+from agent_harness.persistence.retry import FatalError
 from agent_harness.schemas.tool_calling import ChatTurn, ToolCallRequest
 
 load_dotenv()
+
+# Client errors that retrying can never fix -- bad credentials, malformed
+# requests, wrong model/permissions. Re-raised as FatalError so with_backoff
+# fails fast instead of burning 5 retries on something that won't change.
+# Rate limits, server errors, and connection issues are left alone: those
+# are exactly what backoff is for.
+_NON_RETRYABLE_ERRORS: tuple[type[Exception], ...] = (
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    NotFoundError,
+    ConflictError,
+    UnprocessableEntityError,
+)
 
 # USD per 1M tokens, (input, output) -- OpenAI's published prices at write
 # time. Unrecognized models fall back to gpt-4o-mini's rate rather than
@@ -57,11 +80,14 @@ class OpenAIChatClient:
             prepared.insert(0, {"role": "system", "content": tool_text})
 
         typed_messages = cast(list[ChatCompletionMessageParam], prepared)
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=typed_messages,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = self._client.chat.completions.create(
+                model=self._model,
+                messages=typed_messages,
+                response_format={"type": "json_object"},
+            )
+        except _NON_RETRYABLE_ERRORS as exc:
+            raise FatalError(str(exc)) from exc
         content = response.choices[0].message.content
         if content is None:
             raise RuntimeError("Model returned empty content")
@@ -74,15 +100,18 @@ class OpenAIChatClient:
         can reply with tool calls or plain text.
         """
         typed_messages = cast(list[ChatCompletionMessageParam], messages)
-        if tools:
-            typed_tools = cast(list[ChatCompletionToolUnionParam], tools)
-            response = self._client.chat.completions.create(
-                model=self._model, messages=typed_messages, tools=typed_tools
-            )
-        else:
-            response = self._client.chat.completions.create(
-                model=self._model, messages=typed_messages
-            )
+        try:
+            if tools:
+                typed_tools = cast(list[ChatCompletionToolUnionParam], tools)
+                response = self._client.chat.completions.create(
+                    model=self._model, messages=typed_messages, tools=typed_tools
+                )
+            else:
+                response = self._client.chat.completions.create(
+                    model=self._model, messages=typed_messages
+                )
+        except _NON_RETRYABLE_ERRORS as exc:
+            raise FatalError(str(exc)) from exc
 
         message = response.choices[0].message
         # only "function" tools are ever registered, so narrow to that variant

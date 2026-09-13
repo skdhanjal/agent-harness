@@ -54,6 +54,19 @@ a mocked SDK response) and `tests/test_framework.py`
 (`test_harness_records_token_usage_and_cost_from_chat_turn`, proving the
 harness threads a turn's numbers through to the ledger unchanged).
 
+### Retry policy too permissive — fixed
+`OpenAIChatClient` (`agent_harness/schemas/openai_client.py`) now catches the
+OpenAI SDK's non-retryable client errors (`AuthenticationError`,
+`BadRequestError`, `PermissionDeniedError`, `NotFoundError`, `ConflictError`,
+`UnprocessableEntityError`) around both `create_completion` and
+`create_action_turn`'s API calls, and re-raises them as `FatalError` so
+`with_backoff` fails fast instead of retrying 5x. `RateLimitError`,
+`InternalServerError`, and connection/timeout errors are left alone — those
+stay retryable, since that's exactly what backoff is for. Tested in
+`tests/test_openai_client.py`
+(`test_create_action_turn_reraises_auth_error_as_fatal` and
+`test_create_action_turn_still_retries_rate_limit_error`).
+
 ## High (core production gaps)
 
 ### 1. Approval gate has no crash durability
@@ -67,21 +80,9 @@ first as a blocking CLI prompt, later as an async webhook/queue") but the
 there's somewhere to restore a "waiting on approval" state *to* — but nothing
 persists that state as a `PendingAction` in the first place yet.
 
-### 2. Retry policy is too permissive
-`with_backoff` (`agent_harness/persistence/retry.py`) retries everything
-except `FatalError` with exponential backoff (up to 5 attempts). `FatalError`
-is never raised anywhere in production code — only in a test — so a bad API
-key, a malformed request, or a genuine bug surfacing as `TypeError` all get
-retried 5x before finally failing, wasting time and obscuring the real error
-under backoff noise.
-
-Fix shape: in `OpenAIChatClient`, catch the OpenAI SDK's own
-`AuthenticationError`/`BadRequestError`/etc. and re-raise as `FatalError` so
-they fail fast instead of retrying.
-
 ## Medium (scale/quality)
 
-### 3. Memory tiers built but unused
+### 2. Memory tiers built but unused
 `DurableStateStore` and `VectorMemory` (`agent_harness/memory/`) are fully
 implemented and independently tested but never imported by `framework.py` or
 `run_agent.py`. `AgentHarness` has no memory-store fields; every run starts
@@ -93,7 +94,7 @@ Fix shape: needs a product decision first — what should actually be
 persisted across runs for *this* harness's use case — before it's worth
 wiring in mechanically.
 
-### 4. Orchestration not composed into a real driver
+### 3. Orchestration not composed into a real driver
 `ModelRouter`/`SubAgentSpawner` (`agent_harness/orchestration/`) are only
 exercised by `tests/test_module_10_orchestration.py`. `AgentHarness.run()`
 has signature `run(self, task: str)` — no `run_id` override — so the
@@ -108,7 +109,7 @@ Fix shape: add an optional `run_id` param to `run()` (falling back to
 to pick a tier per node and `SubAgentSpawner` to run them, each with its own
 trace file.
 
-### 5. Prompts aren't actually versioned
+### 4. Prompts aren't actually versioned
 `PromptTemplate`/`PromptRegistry` (`agent_harness/prompts/template.py`) exist
 and are tested, but the real system/task instructions are raw f-strings
 built inline in `run_agent.py` (see `RISK_BY_TOOL`'s neighboring
@@ -119,7 +120,7 @@ isn't actually achieved outside the module's own tests.
 
 ## Lower priority (hardening/DX)
 
-### 6. Missing capstone integration test
+### 5. Missing capstone integration test
 `docs/agent_harness_roadmap.md`'s closing step describes
 `tests/test_capstone.py`: a multi-step task through a real approval gate and
 forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
@@ -129,34 +130,34 @@ exist. Checkpoint resume and cost tracking (both above) are done, so this
 test is now fully writable against real behavior — nothing else on this list
 blocks it anymore.
 
-### 7. No CI coverage-threshold enforcement
+### 6. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 8. No installable CLI / packaging
+### 7. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 9. Single-provider lock-in
+### 8. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 10. `TraceLedger` has no rotation/retention policy
+### 9. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 11. No process-wide concurrency cap across parallel sub-agent runs
+### 10. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process
 or host — the "fork bomb of agents calling agents" failure mode the roadmap
-names for Module 10. Only relevant once #4 has a real multi-agent driver to
+names for Module 10. Only relevant once #3 has a real multi-agent driver to
 run more than one spawner at a time.
