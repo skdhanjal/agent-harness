@@ -97,28 +97,35 @@ class AgentHarness:
         tools_schema = self.tools.schema_for_llm()
 
         for _ in range(self.max_iterations):
-            turn = with_backoff(partial(self.client.create_action_turn, messages, tools_schema))
-            self.ledger.log(
-                TraceEvent(
-                    run_id=self.run_id,
-                    event_type="llm_call",
-                    payload={"content": turn.content, "num_tool_calls": len(turn.tool_calls)},
-                    tokens_in=turn.tokens_in,
-                    tokens_out=turn.tokens_out,
-                    cost_usd=turn.cost_usd,
+            pending_calls = self._unresolved_tool_calls(messages)
+
+            if pending_calls is None:
+                turn = with_backoff(partial(self.client.create_action_turn, messages, tools_schema))
+                self.ledger.log(
+                    TraceEvent(
+                        run_id=self.run_id,
+                        event_type="llm_call",
+                        payload={"content": turn.content, "num_tool_calls": len(turn.tool_calls)},
+                        tokens_in=turn.tokens_in,
+                        tokens_out=turn.tokens_out,
+                        cost_usd=turn.cost_usd,
+                    )
                 )
-            )
-            self._checkpoint(messages)
-
-            if not turn.tool_calls:
-                self.fsm.step(Phase.REVIEW)
-                self.fsm.step(Phase.DONE)
                 self._checkpoint(messages)
-                return turn.content or ""
 
-            messages.append(self._assistant_message(turn))
-            for call in turn.tool_calls:
+                if not turn.tool_calls:
+                    self.fsm.step(Phase.REVIEW)
+                    self.fsm.step(Phase.DONE)
+                    self._checkpoint(messages)
+                    return turn.content or ""
+
+                messages.append(self._assistant_message(turn))
+                self._checkpoint(messages)
+                pending_calls = turn.tool_calls
+
+            for call in pending_calls:
                 messages.append(self._execute_tool_call(call))
+                self._checkpoint(messages)
 
             messages = self._compact_if_needed(messages)
 
@@ -126,6 +133,49 @@ class AgentHarness:
             self._checkpoint(messages)
 
         raise MaxIterationsExceededError(f"No final answer within {self.max_iterations} iterations")
+
+    @staticmethod
+    def _unresolved_tool_calls(messages: list[dict[str, object]]) -> list[ToolCallRequest] | None:
+        """Detects a crash-interrupted tool-call batch: the most recent
+        assistant tool-call request whose calls aren't all answered yet by a
+        trailing `role: tool` result. Lets resume() finish exactly the calls
+        that didn't run, instead of re-calling the model and risking a
+        duplicate side effect or a dropped approval.
+        """
+        assistant_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            role = messages[i].get("role")
+            if role == "assistant":
+                assistant_idx = i
+                break
+            if role != "tool":
+                return None
+
+        if assistant_idx is None:
+            return None
+
+        raw_calls = cast(list[dict[str, object]], messages[assistant_idx].get("tool_calls") or [])
+        if not raw_calls:
+            return None
+
+        answered_ids = {
+            m["tool_call_id"] for m in messages[assistant_idx + 1 :] if m.get("role") == "tool"
+        }
+
+        unresolved = []
+        for raw_call in raw_calls:
+            if raw_call["id"] in answered_ids:
+                continue
+            function = cast(dict[str, object], raw_call["function"])
+            unresolved.append(
+                ToolCallRequest(
+                    id=cast(str, raw_call["id"]),
+                    name=cast(str, function["name"]),
+                    arguments=json.loads(cast(str, function["arguments"])),
+                )
+            )
+
+        return unresolved or None
 
     @staticmethod
     def _assistant_message(turn: ChatTurn) -> dict[str, object]:
@@ -145,7 +195,7 @@ class AgentHarness:
     def _execute_tool_call(self, call: ToolCallRequest) -> dict[str, object]:
         risk = self.risk_by_tool.get(call.name, RiskTier.LOW)
         pending = PendingAction(
-            tool_name=call.name, args=call.arguments, risk=risk, run_id=self.run_id
+            id=call.id, tool_name=call.name, args=call.arguments, risk=risk, run_id=self.run_id
         )
 
         if not self.gate.check(pending):

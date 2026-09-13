@@ -105,7 +105,9 @@ agent_harness/
 ├── persistence/
 │   ├── checkpoint.py        # save_checkpoint/load_checkpoint
 │   └── retry.py               # with_backoff, FatalError
-├── gates/approval.py       # RiskTier, ApprovalGate, PendingAction
+├── gates/
+│   ├── approval.py           # RiskTier, ApprovalGate, PendingAction
+│   └── pending_store.py        # durable per-action approval decisions
 ├── tracing/
 │   ├── ledger.py             # TraceLedger, TraceEvent
 │   └── judge.py                # LLMJudge
@@ -323,7 +325,7 @@ in isolation) and `tests/test_framework.py`
 (`test_harness_resumes_from_checkpoint_after_crash` and the two
 `test_resume_raises_*` tests for the not-found / already-finished cases).
 
-### 8. Permission & Approval Gates — `gates/approval.py`
+### 8. Permission & Approval Gates — `gates/approval.py`, `gates/pending_store.py`
 
 `RiskTier` (`LOW < MEDIUM < HIGH`) is assigned per tool name at harness
 construction (`risk_by_tool` in `run_agent.py`). `ApprovalGate.check()`
@@ -332,7 +334,48 @@ else to an `approver` callback — a blocking CLI prompt by default, an
 auto-approve function for non-interactive runs. This is the gate/approve
 branch in the flow diagram above.
 
-Tested in `tests/test_module_08_approval_gates.py`.
+Every gated decision is also durable: `check()` persists `status="pending"`
+for the action's id via `gates/pending_store.py` *before* calling the
+approver, then persists the resolution (`"approved"`/`"denied"`) right
+after. A repeat `check()` for an id that already resolved returns that
+decision straight from disk without invoking the approver again. On the
+`AgentHarness` side, `_run_loop` (`framework.py`) checkpoints after the
+assistant's tool-call message and after each individual tool call — not
+just once per iteration — and a `_unresolved_tool_calls` scan lets both a
+fresh `run()` continuation and `resume()` detect a tool-call batch that
+didn't finish (some calls already executed, one still needs approval,
+some never started) and pick up exactly the unresolved calls instead of
+re-calling the model.
+
+**Why this design:**
+
+- **The provider's own `tool_call_id` is reused as the pending action's id,
+  instead of minting a new one.** It's already unique per call within a run
+  and — because it's just a string sitting in the checkpointed `messages`
+  JSON — it round-trips verbatim across a crash and `resume()` with zero
+  extra state to manage. A separately-generated id would need its own
+  storage to survive the same crash it's meant to protect against.
+- **`gates/pending_store.py` is a sibling of `persistence/checkpoint.py`,
+  not folded into it.** Same shape (plain functions, one JSON file per
+  `run_id`) deliberately duplicated rather than shared, so Module 8 stays
+  independent of Module 7 per the dependency graph below — `ApprovalGate`
+  doesn't need `AgentHarness` or its checkpoint format to exist at all to
+  be crash-durable on its own terms.
+- **Persisting the decision alone isn't sufficient — the harness's
+  checkpoint granularity had to tighten too.** A `PendingAction` durably
+  recorded as "approved" is useless to a resumed run if `messages` itself
+  was only checkpointed *before* the model's tool-call turn was appended;
+  resume would just re-call the model for a fresh turn with new
+  `tool_call_id`s, and the old pending record would never be looked up
+  again. Checkpointing after the assistant message and after each tool
+  call is what actually lets `resume()` restore into a genuine
+  "waiting on approval" state instead of only leaving an audit trail of
+  one it can no longer act on.
+
+Tested in `tests/test_module_08_approval_gates.py` (decision persisted
+before the approver runs; a resumed gate replays an already-made
+approval/denial without re-asking) and `tests/test_framework.py`
+(`test_harness_resumes_mid_tool_call_batch_without_reexecuting_or_reasking`).
 
 ### 9. Tracing & Evals — `tracing/`
 
@@ -450,9 +493,11 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail; see it for what's still open (approval-gate crash durability, retry
-policy, and further down the priority list).
+detail; see it for what's still open (memory tiers unused, no real
+multi-agent driver, prompts not versioned, and further down the priority
+list).
 
-(Unbounded context growth, checkpoint resume, and cost/token tracking were
-the most load-bearing items in this list; all three are now fixed — see
-Module 4, Module 7, and Module 9 above.)
+(Unbounded context growth, checkpoint resume, cost/token tracking, approval-
+gate crash durability, and an overly permissive retry policy were the most
+load-bearing items in this list; all five are now fixed — see Module 4,
+Module 7, Module 8, and Module 9 above.)

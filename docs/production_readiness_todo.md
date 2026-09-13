@@ -54,6 +54,32 @@ a mocked SDK response) and `tests/test_framework.py`
 (`test_harness_records_token_usage_and_cost_from_chat_turn`, proving the
 harness threads a turn's numbers through to the ledger unchanged).
 
+### Approval gate has no crash durability — fixed
+`ApprovalGate.check()` (`agent_harness/gates/approval.py`) now persists every
+gated decision by `action.id` (the provider's own tool_call_id) through a new
+`agent_harness/gates/pending_store.py` — `status="pending"` is written to
+disk *before* the approver is invoked, and the resolution
+(`"approved"`/`"denied"`) right after. A repeat `check()` for an id that
+already resolved returns that decision without touching the approver again.
+On its own this only gave crash *evidence*, not crash *recovery* — the real
+gap was that `AgentHarness._run_loop` (`agent_harness/framework.py`) only
+checkpointed at whole-iteration boundaries, so a crash mid-batch (e.g.
+blocked approving the 2nd of 3 tool calls) had no checkpointed record of
+which calls the model had already decided on or which had already run.
+`_run_loop` now checkpoints after the assistant's tool-call message and
+after each individual tool call, and a new `_unresolved_tool_calls` scan
+lets both fresh entry and `resume()` detect an in-progress, not-fully-
+answered tool-call batch and finish exactly the unresolved calls instead of
+re-calling the model. Full design rationale — why `tool_call_id` doubles as
+the durable id instead of minting a new one, why the pending store is a
+sibling of `persistence/checkpoint.py` rather than folded into it, and why
+persisting the decision alone wasn't enough without the finer checkpoint
+granularity — is written up in `docs/agent_harness_roadmap.md`'s Module 8
+section. Tested in `tests/test_module_08_approval_gates.py` (decision
+persisted before the approver runs; a resumed gate replays an already-made
+approval/denial without re-asking) and `tests/test_framework.py`
+(`test_harness_resumes_mid_tool_call_batch_without_reexecuting_or_reasking`).
+
 ### Retry policy too permissive — fixed
 `OpenAIChatClient` (`agent_harness/schemas/openai_client.py`) now catches the
 OpenAI SDK's non-retryable client errors (`AuthenticationError`,
@@ -67,22 +93,9 @@ stay retryable, since that's exactly what backoff is for. Tested in
 (`test_create_action_turn_reraises_auth_error_as_fatal` and
 `test_create_action_turn_still_retries_rate_limit_error`).
 
-## High (core production gaps)
-
-### 1. Approval gate has no crash durability
-`ApprovalGate` (`agent_harness/gates/approval.py`) is purely synchronous —
-`check()` calls the approver inline; the default blocks on `input()`. No
-`PendingAction` is ever persisted, and there's no linkage to checkpointing.
-If the process crashes while waiting on approval, the pending decision is
-gone. The roadmap's own Module 8 spec calls for this explicitly ("implemented
-first as a blocking CLI prompt, later as an async webhook/queue") but the
-"later" part was never built. Checkpoint resume (now fixed, see above) means
-there's somewhere to restore a "waiting on approval" state *to* — but nothing
-persists that state as a `PendingAction` in the first place yet.
-
 ## Medium (scale/quality)
 
-### 2. Memory tiers built but unused
+### 1. Memory tiers built but unused
 `DurableStateStore` and `VectorMemory` (`agent_harness/memory/`) are fully
 implemented and independently tested but never imported by `framework.py` or
 `run_agent.py`. `AgentHarness` has no memory-store fields; every run starts
@@ -94,7 +107,7 @@ Fix shape: needs a product decision first — what should actually be
 persisted across runs for *this* harness's use case — before it's worth
 wiring in mechanically.
 
-### 3. Orchestration not composed into a real driver
+### 2. Orchestration not composed into a real driver
 `ModelRouter`/`SubAgentSpawner` (`agent_harness/orchestration/`) are only
 exercised by `tests/test_module_10_orchestration.py`. `AgentHarness.run()`
 has signature `run(self, task: str)` — no `run_id` override — so the
@@ -109,7 +122,7 @@ Fix shape: add an optional `run_id` param to `run()` (falling back to
 to pick a tier per node and `SubAgentSpawner` to run them, each with its own
 trace file.
 
-### 4. Prompts aren't actually versioned
+### 3. Prompts aren't actually versioned
 `PromptTemplate`/`PromptRegistry` (`agent_harness/prompts/template.py`) exist
 and are tested, but the real system/task instructions are raw f-strings
 built inline in `run_agent.py` (see `RISK_BY_TOOL`'s neighboring
@@ -120,7 +133,7 @@ isn't actually achieved outside the module's own tests.
 
 ## Lower priority (hardening/DX)
 
-### 5. Missing capstone integration test
+### 4. Missing capstone integration test
 `docs/agent_harness_roadmap.md`'s closing step describes
 `tests/test_capstone.py`: a multi-step task through a real approval gate and
 forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
@@ -130,34 +143,34 @@ exist. Checkpoint resume and cost tracking (both above) are done, so this
 test is now fully writable against real behavior — nothing else on this list
 blocks it anymore.
 
-### 6. No CI coverage-threshold enforcement
+### 5. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 7. No installable CLI / packaging
+### 6. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 8. Single-provider lock-in
+### 7. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 9. `TraceLedger` has no rotation/retention policy
+### 8. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 10. No process-wide concurrency cap across parallel sub-agent runs
+### 9. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process
 or host — the "fork bomb of agents calling agents" failure mode the roadmap
-names for Module 10. Only relevant once #3 has a real multi-agent driver to
+names for Module 10. Only relevant once #2 has a real multi-agent driver to
 run more than one spawner at a time.

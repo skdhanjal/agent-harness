@@ -53,7 +53,11 @@ def main() -> None:
     harness = AgentHarness(
         client=OpenAIChatClient(model="gpt-4o-mini"),
         tools=tools,
-        gate=ApprovalGate(require_approval_at=RiskTier.HIGH, approver=auto_approve),
+        gate=ApprovalGate(
+            require_approval_at=RiskTier.HIGH,
+            approver=auto_approve,
+            pending_dir=f"./run_output/{run_id}/pending_actions",
+        ),
         ledger=TraceLedger(f"./run_output/{run_id}/traces.jsonl"),
         run_id=run_id,
         instructions=(

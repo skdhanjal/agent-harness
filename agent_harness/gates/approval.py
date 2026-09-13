@@ -12,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 
+from agent_harness.gates import pending_store
+
 
 class RiskTier(IntEnum):
     """IntEnum so tiers compare naturally: LOW < MEDIUM < HIGH."""
@@ -23,6 +25,7 @@ class RiskTier(IntEnum):
 
 @dataclass(frozen=True)
 class PendingAction:
+    id: str
     tool_name: str
     args: dict[str, object]
     risk: RiskTier
@@ -30,20 +33,40 @@ class PendingAction:
 
 
 class ApprovalGate:
-    """Auto-approves below a threshold; everything at/above it needs a human."""
+    """Auto-approves below a threshold; everything at/above it needs a human.
+
+    Decisions are persisted by `action.id` (the provider's own tool_call_id)
+    so a resumed run replays an already-made decision instead of asking
+    again, and a crash mid-approval still leaves evidence of what was
+    pending -- see docs/agent_harness_roadmap.md's Module 8 section.
+    """
 
     def __init__(
         self,
         require_approval_at: RiskTier = RiskTier.HIGH,
         approver: Callable[[PendingAction], bool] | None = None,
+        pending_dir: str = "./pending_actions",
     ) -> None:
         self.require_approval_at = require_approval_at
         self._approver = approver or self._cli_approver
+        self.pending_dir = pending_dir
 
     def check(self, action: PendingAction) -> bool:
         if action.risk < self.require_approval_at:
             return True
-        return self._approver(action)
+
+        status = pending_store.load_status(action.run_id, action.id, directory=self.pending_dir)
+        if status == "approved":
+            return True
+        if status == "denied":
+            return False
+
+        pending_store.mark_pending(
+            action.run_id, action.id, action.tool_name, action.args, directory=self.pending_dir
+        )
+        approved = self._approver(action)
+        pending_store.resolve(action.run_id, action.id, approved, directory=self.pending_dir)
+        return approved
 
     @staticmethod
     def _cli_approver(action: PendingAction) -> bool:

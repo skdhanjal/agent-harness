@@ -9,6 +9,7 @@ loop is verified deterministically.
 """
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ from agent_harness.framework import (
     CheckpointNotFoundError,
     RunAlreadyFinishedError,
 )
-from agent_harness.gates.approval import ApprovalGate, RiskTier
+from agent_harness.gates.approval import ApprovalGate, PendingAction, RiskTier
 from agent_harness.persistence.checkpoint import load_checkpoint
 from agent_harness.persistence.retry import FatalError
 from agent_harness.schemas.tool_calling import ChatTurn, ToolCallRequest
@@ -65,7 +66,10 @@ def test_harness_runs_tool_call_then_final_answer(tmp_path: Path) -> None:
     register_filesystem_tools(tools, root=tmp_path)
 
     ledger = TraceLedger(tmp_path / "traces.jsonl")
-    gate = ApprovalGate(approver=lambda action: True)  # auto-approve, no blocking input()
+    gate = ApprovalGate(
+        approver=lambda action: True,  # auto-approve, no blocking input()
+        pending_dir=str(tmp_path / "pending"),
+    )
 
     harness = AgentHarness(
         client=client,
@@ -129,7 +133,7 @@ def test_harness_records_token_usage_and_cost_from_chat_turn(tmp_path: Path) -> 
     harness = AgentHarness(
         client=client,
         tools=tools,
-        gate=ApprovalGate(approver=lambda action: True),
+        gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
         ledger=TraceLedger(traces_path),
         run_id="test-run-cost",
         instructions="x",
@@ -170,7 +174,9 @@ def test_harness_respects_denied_approval(tmp_path: Path) -> None:
     tools = ToolRegistry()
     register_filesystem_tools(tools, root=tmp_path)
 
-    gate = ApprovalGate(approver=lambda action: False)  # deny everything
+    gate = ApprovalGate(
+        approver=lambda action: False, pending_dir=str(tmp_path / "pending")
+    )  # deny everything
 
     harness = AgentHarness(
         client=client,
@@ -223,7 +229,7 @@ def test_harness_compacts_context_once_over_budget(tmp_path: Path) -> None:
     harness = AgentHarness(
         client=client,
         tools=tools,
-        gate=ApprovalGate(approver=lambda action: True),
+        gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
         ledger=TraceLedger(traces_path),
         run_id="test-run-compaction",
         instructions="Write three notes.",
@@ -277,7 +283,7 @@ def test_harness_resumes_from_checkpoint_after_crash(tmp_path: Path) -> None:
         return AgentHarness(
             client=client,
             tools=tools,
-            gate=ApprovalGate(approver=lambda action: True),
+            gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
             ledger=TraceLedger(tmp_path / "traces.jsonl"),
             run_id="resume-run",
             instructions="Write a note and save it.",
@@ -319,13 +325,85 @@ def test_harness_resumes_from_checkpoint_after_crash(tmp_path: Path) -> None:
     }
 
 
+def test_harness_resumes_mid_tool_call_batch_without_reexecuting_or_reasking(
+    tmp_path: Path,
+) -> None:
+    """One LLM turn requests two tool calls; the approver raises on the
+    second (stand-in for a crash while blocked on approval, same technique
+    as test_harness_resumes_from_checkpoint_after_crash above). Resume must
+    finish only the unresolved second call -- not re-execute the first, and
+    not re-call the model for a turn it already has the answer to.
+    """
+    path1 = tmp_path / "note1.md"
+    path2 = tmp_path / "note2.md"
+    checkpoint_dir = tmp_path / "checkpoints"
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+
+    class CrashOnSecondApproval:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, action: object) -> bool:
+            self.calls += 1
+            if self.calls == 2:
+                raise FatalError("simulated crash while waiting on approval")
+            return True
+
+    def make_harness(
+        client: ScriptedToolCallingClient, approver: Callable[[PendingAction], bool]
+    ) -> AgentHarness:
+        return AgentHarness(
+            client=client,
+            tools=tools,
+            gate=ApprovalGate(approver=approver, pending_dir=str(tmp_path / "pending")),
+            ledger=TraceLedger(tmp_path / "traces.jsonl"),
+            run_id="resume-batch",
+            instructions="Write two notes and save them.",
+            risk_by_tool={"write_file": RiskTier.HIGH},
+            checkpoint_dir=str(checkpoint_dir),
+        )
+
+    crashing_client = ScriptedToolCallingClient(
+        [
+            ChatTurn(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="write_file",
+                        arguments={"path": path1.as_posix(), "content": "one"},
+                    ),
+                    ToolCallRequest(
+                        id="call_2",
+                        name="write_file",
+                        arguments={"path": path2.as_posix(), "content": "two"},
+                    ),
+                ],
+            ),
+        ]
+    )
+    with pytest.raises(FatalError):
+        make_harness(crashing_client, CrashOnSecondApproval()).run("write two notes")
+
+    assert path1.read_text() == "one"
+    assert not path2.exists()
+
+    resumed_client = ScriptedToolCallingClient([ChatTurn(content="Done.", tool_calls=[])])
+    result = make_harness(resumed_client, lambda action: True).resume()
+
+    assert result == "Done."
+    assert path2.read_text() == "two"
+    assert len(resumed_client.calls) == 1  # no re-ask of the model for calls 1/2
+
+
 def test_resume_raises_when_no_checkpoint_exists(tmp_path: Path) -> None:
     tools = ToolRegistry()
     register_filesystem_tools(tools, root=tmp_path)
     harness = AgentHarness(
         client=ScriptedToolCallingClient([]),
         tools=tools,
-        gate=ApprovalGate(approver=lambda action: True),
+        gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
         ledger=TraceLedger(tmp_path / "traces.jsonl"),
         run_id="never-ran",
         instructions="x",
@@ -344,7 +422,7 @@ def test_resume_raises_when_run_already_finished(tmp_path: Path) -> None:
     harness = AgentHarness(
         client=client,
         tools=tools,
-        gate=ApprovalGate(approver=lambda action: True),
+        gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
         ledger=TraceLedger(tmp_path / "traces.jsonl"),
         run_id="finished-run",
         instructions="x",
