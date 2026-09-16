@@ -92,7 +92,7 @@ agent_harness/
 │   ├── registry.py        # ToolRegistry: schema derivation, arg validation, sandboxed execution
 │   ├── filesystem.py       # read/write/list/glob/grep/stat/mkdir/move/delete
 │   └── sandbox.py           # PathSandbox: confines every tool path to a root
-├── prompts/template.py    # PromptTemplate/PromptRegistry -- built, not yet wired in (see gaps)
+├── prompts/template.py    # PromptTemplate/PromptRegistry -- wired into run_agent.py, see Module 3 below
 ├── context/
 │   ├── builder.py           # ContextBuilder -- block truncation, built, not yet wired in (see gaps)
 │   ├── tokens.py             # count_tokens, count_messages_tokens
@@ -154,11 +154,48 @@ Tested in `tests/test_module_02_tool_calling.py`, `tests/test_filesystem_tools.p
 
 `PromptTemplate`/`PromptRegistry` give prompts a name, a version, and strict
 variable substitution (a missing variable fails loudly, naming the exact
-prompt and version, instead of silently blanking). **Not currently wired
-in** — the harness's real instructions live as raw f-strings in
-`run_agent.py`. See `docs/production_readiness_todo.md`.
+prompt and version, instead of silently blanking).
 
-Tested in `tests/test_module_03_prompt_ownership.py`.
+`run_agent.py` now registers its instructions as
+`filesystem_agent@v1` in a module-level `PromptRegistry` and renders it
+(`PROMPTS.get("filesystem_agent").render(task=task)`) instead of building
+an f-string inline. The resulting `RenderedPrompt.prompt_id` is passed to
+`AgentHarness` as a new constructor field and logged once, in a
+`run_start` `TraceEvent` (`agent_harness/tracing/ledger.py`) written at the
+top of `run()` before the first model call — so which prompt version
+produced a given run's output is now recoverable from the trace ledger
+itself (join on `run_id`), not just from whatever string the caller
+happened to pass in that run.
+
+**Why this design:**
+
+- **Why `prompt_id` is logged once, in a `run_start` event, rather than
+  attached to every `llm_call` event.** A run has exactly one system
+  prompt for its entire lifetime — `instructions` is set once in
+  `AgentHarness.__init__` and never changes mid-run. Repeating it on every
+  `llm_call` event would just be the same value copied across N rows;
+  `run_id` already lets a query join any event back to its run's single
+  `run_start` row.
+- **Why prompt selection/rendering lives in `run_agent.py`, not inside
+  `AgentHarness`.** This mirrors how `risk_by_tool` and `run_id` already
+  work: the harness takes already-resolved configuration, it doesn't own
+  the policy that produced it. Pushing `PromptRegistry` lookups into
+  `AgentHarness` would make the harness responsible for prompt naming and
+  versioning decisions that are really the caller's — a different caller
+  (e.g. a future second entry point) may want a different prompt name or
+  version entirely.
+- **Why `user_tmpl` is just `"$task"`.** The task string is free-form user
+  input, not something with a fixed shape worth templating — there's
+  nothing to parameterize inside it. Routing it through `render()` anyway
+  (rather than passing `task` straight to `harness.run()`) is what makes
+  the *user* half of the prompt provably go through the same
+  strict-substitution path as the system half, matching Module 3's actual
+  goal instead of only wiring the system prompt.
+
+Tested in `tests/test_module_03_prompt_ownership.py` (the module's own
+tests) and `tests/test_framework.py::test_harness_logs_prompt_id_at_run_start`
+(proving the harness actually logs the `run_start` event with the
+`prompt_id` it was constructed with).
 
 ### 4. Context Construction — `context/builder.py`, `context/tokens.py`, `context/compaction.py`
 
@@ -599,12 +636,12 @@ Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
 detail; see it for what's still open (semantic memory unused, no LLM-driven
-task decomposition, prompts not versioned, and further down the priority
-list).
+task decomposition, and further down the priority list).
 
 (Unbounded context growth, checkpoint resume, cost/token tracking, approval-
 gate crash durability, an overly permissive retry policy, durable facts
 memory being built but unused, and orchestration never composed into a real
 driver were the most load-bearing items in this list; all seven are now
 fixed — see Module 4, Module 6, Module 7, Module 8, Module 9, and Module 10
-above.)
+above. Prompts not being versioned in the live loop is fixed too — see
+Module 3 above.)

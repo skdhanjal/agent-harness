@@ -152,6 +152,35 @@ def test_harness_records_token_usage_and_cost_from_chat_turn(tmp_path: Path) -> 
     assert llm_calls[1]["cost_usd"] == pytest.approx(0.00006)
 
 
+def test_harness_logs_prompt_id_at_run_start(tmp_path: Path) -> None:
+    """Which prompt version produced a run's output should be recoverable
+    from the trace ledger alone, not just from whatever instructions string
+    the caller happened to pass in.
+    """
+    client = ScriptedToolCallingClient([ChatTurn(content="Done.", tool_calls=[])])
+
+    tools = ToolRegistry()
+    register_filesystem_tools(tools, root=tmp_path)
+    traces_path = tmp_path / "traces.jsonl"
+
+    harness = AgentHarness(
+        client=client,
+        tools=tools,
+        gate=ApprovalGate(approver=lambda action: True, pending_dir=str(tmp_path / "pending")),
+        ledger=TraceLedger(traces_path),
+        run_id="test-run-prompt-id",
+        instructions="x",
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        prompt_id="greet@v1",
+    )
+    harness.run("do something")
+
+    trace_events = [json.loads(line) for line in traces_path.read_text().splitlines()]
+    run_starts = [e for e in trace_events if e["event_type"] == "run_start"]
+    assert len(run_starts) == 1
+    assert run_starts[0]["payload"] == {"prompt_id": "greet@v1", "task": "do something"}
+
+
 def test_harness_respects_denied_approval(tmp_path: Path) -> None:
     denied_path = tmp_path / "x.md"
 

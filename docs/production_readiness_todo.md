@@ -152,6 +152,22 @@ stay retryable, since that's exactly what backoff is for. Tested in
 (`test_create_action_turn_reraises_auth_error_as_fatal` and
 `test_create_action_turn_still_retries_rate_limit_error`).
 
+### Prompts aren't actually versioned — fixed
+`run_agent.py` now registers its instructions as `filesystem_agent@v1` in a
+module-level `PromptRegistry` and renders both the system and user halves
+through `PromptTemplate.render()` instead of building an f-string inline.
+`AgentHarness` (`agent_harness/framework.py`) takes the resulting
+`RenderedPrompt.prompt_id` as a new constructor field and logs it once, in
+a `run_start` `TraceEvent`, at the top of `run()` — so which prompt version
+produced a given run's output is now recoverable from the trace ledger
+itself instead of being lost outside `run_agent.py`. Full design
+rationale — why `prompt_id` is logged once per run instead of on every
+`llm_call` event, why prompt selection stays a caller concern rather than
+moving into `AgentHarness`, and why the user-half template is a trivial
+`"$task"` passthrough — is written up in `docs/agent_harness_roadmap.md`'s
+Module 3 section. Tested in `tests/test_module_03_prompt_ownership.py` and
+`tests/test_framework.py::test_harness_logs_prompt_id_at_run_start`.
+
 ## Medium (scale/quality)
 
 ### 1. Semantic memory (VectorMemory) still unwired
@@ -187,18 +203,9 @@ edge resolution to fall back on (nodes already run fully in parallel, so a
 decomposition that assumes ordering between nodes would silently be wrong,
 not just slow).
 
-### 3. Prompts aren't actually versioned
-`PromptTemplate`/`PromptRegistry` (`agent_harness/prompts/template.py`) exist
-and are tested, but the real system/task instructions are raw f-strings
-built inline in `run_agent.py` (see `RISK_BY_TOOL`'s neighboring
-`instructions=(...)` block) — not routed through `PromptRegistry.render()`.
-No `TraceEvent` ever records which prompt version produced a given run, so
-Module 3's explicit goal (know which prompt version produced which output)
-isn't actually achieved outside the module's own tests.
-
 ## Lower priority (hardening/DX)
 
-### 4. Missing capstone integration test
+### 3. Missing capstone integration test
 `docs/agent_harness_roadmap.md`'s closing step describes
 `tests/test_capstone.py`: a multi-step task through a real approval gate and
 forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
@@ -208,31 +215,31 @@ exist. Checkpoint resume and cost tracking (both above) are done, so this
 test is now fully writable against real behavior — nothing else on this list
 blocks it anymore.
 
-### 5. No CI coverage-threshold enforcement
+### 4. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 6. No installable CLI / packaging
+### 5. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 7. Single-provider lock-in
+### 6. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 8. `TraceLedger` has no rotation/retention policy
+### 7. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 9. No process-wide concurrency cap across parallel sub-agent runs
+### 8. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process

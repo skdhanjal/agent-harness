@@ -55,6 +55,7 @@ class AgentHarness:
         max_iterations: int = 5,
         checkpoint_dir: str = "./checkpoints",
         context_token_budget: int = 8_000,
+        prompt_id: str | None = None,
     ) -> None:
         self.client = client
         self.tools = tools
@@ -63,6 +64,7 @@ class AgentHarness:
         self.run_id = run_id
         self.instructions = instructions
         self.risk_by_tool = risk_by_tool or {}
+        self.prompt_id = prompt_id
         self.max_iterations = max_iterations
         self.checkpoint_dir = checkpoint_dir
         self.context_token_budget = context_token_budget
@@ -71,6 +73,13 @@ class AgentHarness:
 
     def run(self, task: str) -> str:
         self.fsm.step(Phase.EXECUTE)  # PLAN -> EXECUTE: the only legal first move
+        self.ledger.log(
+            TraceEvent(
+                run_id=self.run_id,
+                event_type="run_start",
+                payload={"prompt_id": self.prompt_id, "task": task},
+            )
+        )
         messages: list[dict[str, object]] = [
             {"role": "system", "content": self.instructions},
             {"role": "user", "content": task},

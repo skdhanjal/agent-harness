@@ -12,7 +12,7 @@ from pathlib import Path
 @dataclass
 class TraceEvent:
     run_id: str
-    # "llm_call" | "tool_call" | "transition" | "gate_decision" | "context_compaction"
+    # "run_start" | "llm_call" | "tool_call" | "transition" | "gate_decision" | "context_compaction"
     event_type: str
     payload: dict[str, object]
     tokens_in: int = 0
