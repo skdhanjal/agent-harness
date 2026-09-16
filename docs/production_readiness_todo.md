@@ -104,6 +104,41 @@ out as its own item since it turned out to need a materially different kind
 of decision (an embeddings provider and a persistence format that don't
 exist yet, not just a wiring change).
 
+### Orchestration not composed into a real driver — fixed
+`agent_harness/orchestration/driver.py`'s new `OrchestrationDriver` is the
+piece that actually composes `ModelRouter` and `SubAgentSpawner`: it picks
+each `DagNode`'s starting tier from `node.difficulty`, runs the pending
+batch through `SubAgentSpawner`, and retries any node that failed one tier
+up via `ModelRouter.escalate()`, up to `max_attempts` — nodes that already
+succeeded are never re-run. `run_orchestrated.py` (new, the multi-agent
+counterpart to `run_agent.py`) wires this against real `AgentHarness`
+instances, each with its own `run_id`, trace file, and checkpoint dir
+nested under the parent orchestration run. Getting there also required
+fixing `SubAgentSpawner` itself: `run_dag` no longer lets one node's
+exception propagate and abort the whole batch (`NodeResult(ok, result,
+error)` now, mirroring `ToolExecutionResult`), and `harness_factory` now
+receives the node being built for, not zero args — neither was survivable
+by a driver that needs to see per-node failures and give different nodes
+different config. Full design rationale — including why `run_id` ended up
+*not* added to `AgentHarness.run()`, a deliberate change from this item's
+original fix-shape note — is written up in
+`docs/agent_harness_roadmap.md`'s Module 10 section. Tested in
+`tests/test_module_10_orchestration.py` (router behavior, spawner
+completing all nodes under `max_workers` while capturing a failing node's
+error without losing a sibling's result) and
+`tests/test_orchestration_driver.py` (tier-by-difficulty, escalate-and-
+retry on failure, give-up after `max_attempts`, one node's failure never
+blocking a sibling).
+
+`docs/agent_harness_roadmap.md`'s own spawner sketch used a single reused
+harness instance and a `run_id` passed to `run()` — deliberately not what
+got built; see Module 10's "why this design" for why a fresh harness per
+node ended up the right call instead. LLM-driven task decomposition
+(turning one task string into this `DagNode` list) is deliberately **not**
+part of this fix — see "LLM-driven task decomposition not implemented"
+below, split out as its own item since it's a planning feature with its
+own failure modes, not a wiring change.
+
 ### Retry policy too permissive — fixed
 `OpenAIChatClient` (`agent_harness/schemas/openai_client.py`) now catches the
 OpenAI SDK's non-retryable client errors (`AuthenticationError`,
@@ -137,20 +172,20 @@ local embedder (weaker retrieval quality, zero extra cost/dependency) —
 plus a persistence format for the vectors, before it's a well-scoped
 wiring change like the facts-memory fix was.
 
-### 2. Orchestration not composed into a real driver
-`ModelRouter`/`SubAgentSpawner` (`agent_harness/orchestration/`) are only
-exercised by `tests/test_module_10_orchestration.py`. `AgentHarness.run()`
-has signature `run(self, task: str)` — no `run_id` override — so the
-roadmap's own spawner sketch (`agent.run(node.task, run_id=f"{parent}::{node.id}")`,
-`docs/agent_harness_roadmap.md`) can't work as written: every spawned
-sub-agent would log under the same `run_id` fixed at harness construction,
-not a distinct per-node id. There's no driver script anywhere that
-decomposes a task into a DAG and actually routes/spawns.
+### 2. LLM-driven task decomposition not implemented
+`OrchestrationDriver` (`agent_harness/orchestration/driver.py`, see "Fixed"
+above) and `run_orchestrated.py` both take an already-built `list[DagNode]`
+— nothing turns one task string into that list. `run_orchestrated.py`'s
+`DEFAULT_NODES` is hand-written, so orchestration only actually runs for a
+task someone has already broken into independent subtasks by hand.
 
-Fix shape: add an optional `run_id` param to `run()` (falling back to
-`self.run_id`), then build a real orchestrator module that uses `ModelRouter`
-to pick a tier per node and `SubAgentSpawner` to run them, each with its own
-trace file.
+Fix shape: a `decompose_task(task: str, client: ...) -> list[DagNode]` step
+that prompts the model for a subtask breakdown (via `generate_structured`,
+Module 1) and validates the result — at minimum reject-and-retry on a cyclic
+or empty decomposition, since `SubAgentSpawner.run_dag` has no dependency-
+edge resolution to fall back on (nodes already run fully in parallel, so a
+decomposition that assumes ordering between nodes would silently be wrong,
+not just slow).
 
 ### 3. Prompts aren't actually versioned
 `PromptTemplate`/`PromptRegistry` (`agent_harness/prompts/template.py`) exist
@@ -202,5 +237,8 @@ just appends to one JSONL file forever.
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process
 or host — the "fork bomb of agents calling agents" failure mode the roadmap
-names for Module 10. Only relevant once #2 has a real multi-agent driver to
-run more than one spawner at a time.
+names for Module 10. `OrchestrationDriver` (see "Fixed" above) makes this
+easier to hit in practice, since a single `run_orchestrated.py` invocation
+can now genuinely spin up several concurrent `AgentHarness` instances; there
+still isn't anything capping spend *across* separate `OrchestrationDriver`
+runs in the same process or host.

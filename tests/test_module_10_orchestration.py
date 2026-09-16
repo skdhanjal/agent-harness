@@ -4,7 +4,8 @@ Proves: the router picks higher tiers for harder tasks, never exceeds
 the top tier regardless of how bad things get, and escalate() moves up
 one tier at a time, capping at the top. Proves the spawner runs all
 nodes to completion while never exceeding max_workers concurrently --
-the real correctness property, not just "it eventually finishes."
+the real correctness property, not just "it eventually finishes" -- and
+that one node raising doesn't take the rest of the batch's results with it.
 """
 
 import threading
@@ -86,11 +87,34 @@ class _TrackingHarness:
 
 def test_spawner_completes_all_nodes_and_respects_max_workers() -> None:
     tracker = _ConcurrencyTracker()
-    spawner = SubAgentSpawner(harness_factory=lambda: _TrackingHarness(tracker), max_workers=2)
+    spawner = SubAgentSpawner(harness_factory=lambda node: _TrackingHarness(tracker), max_workers=2)
     nodes = [DagNode(id=f"n{i}", task=f"task-{i}") for i in range(5)]
 
     results = spawner.run_dag(nodes)
 
     assert len(results) == 5
-    assert all(results[f"n{i}"] == f"done:task-{i}" for i in range(5))
+    assert all(results[f"n{i}"].ok is True for i in range(5))
+    assert all(results[f"n{i}"].result == f"done:task-{i}" for i in range(5))
     assert tracker.peak <= 2
+
+
+class _FailingHarness:
+    def run(self, task: str) -> str:
+        raise RuntimeError(f"boom on {task}")
+
+
+def test_spawner_captures_a_node_failure_without_losing_other_results() -> None:
+    tracker = _ConcurrencyTracker()
+
+    def factory(node: DagNode) -> object:
+        return _FailingHarness() if node.id == "bad" else _TrackingHarness(tracker)
+
+    spawner = SubAgentSpawner(harness_factory=factory, max_workers=2)
+    nodes = [DagNode(id="good", task="ok"), DagNode(id="bad", task="explode")]
+
+    results = spawner.run_dag(nodes)
+
+    assert results["good"].ok is True
+    assert results["good"].result == "done:ok"
+    assert results["bad"].ok is False
+    assert results["bad"].error is not None and "boom on explode" in results["bad"].error

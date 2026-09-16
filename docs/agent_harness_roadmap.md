@@ -113,8 +113,9 @@ agent_harness/
 │   ├── ledger.py             # TraceLedger, TraceEvent
 │   └── judge.py                # LLMJudge
 └── orchestration/
-    ├── router.py             # ModelRouter -- built, not yet composed into a driver (see gaps)
-    └── spawner.py              # SubAgentSpawner -- same
+    ├── router.py             # ModelRouter: tier selection + escalate-on-failure
+    ├── spawner.py              # SubAgentSpawner: bounded-concurrency DAG execution
+    └── driver.py                # OrchestrationDriver: composes both into a real driver
 ```
 
 ## Module reference
@@ -467,12 +468,74 @@ harness threads a turn's numbers through to the ledger unchanged).
 `ModelRouter` picks a model tier from estimated difficulty and prior
 failure count, capped at the top tier no matter how many failures pile up.
 `SubAgentSpawner` runs a DAG of sub-tasks across a bounded thread pool, each
-as its own harness instance. Neither is composed into a real multi-agent
-driver yet — `AgentHarness.run()` doesn't even accept a `run_id` override,
-which a real spawner would need to give each sub-agent its own trace file.
-See `docs/production_readiness_todo.md`.
+as its own harness instance. `OrchestrationDriver` (`orchestration/driver.py`)
+is the piece that actually composes them: for each `DagNode`, it picks a
+starting tier from `node.difficulty` via `ModelRouter.choose()`, runs the
+whole pending batch through `SubAgentSpawner`, and for any node that failed
+and hasn't hit `max_attempts`, calls `ModelRouter.escalate()` and retries
+just that node one tier up — nodes that already succeeded are never
+re-run. `run_orchestrated.py` is the multi-agent counterpart to
+`run_agent.py`: it builds a real per-node `AgentHarness` (own `run_id`,
+trace file, and checkpoint dir, nested under the parent orchestration run)
+via `OrchestrationDriver`'s injected `harness_builder`. Task decomposition
+— turning one task string into a `DagNode` list — isn't part of this;
+`run_orchestrated.py`'s `DEFAULT_NODES` is hand-written. See
+`docs/production_readiness_todo.md`.
 
-Tested in `tests/test_module_10_orchestration.py`.
+**Why this design:**
+
+- **`SubAgentSpawner.run_dag` never lets a node's exception propagate.**
+  Before this fix, `_run_node` called `agent.run(node.task)` directly, so
+  one failing node's exception surfaced through `future.result()` inside
+  `run_dag`'s loop and aborted the whole batch — every other node's
+  (possibly already-finished) result was lost with it. `_run_node` now
+  catches and returns a `NodeResult(ok, result, error)`, the same
+  `ok`/`result`/`error` shape `ToolExecutionResult` already uses in
+  `tools/registry.py` — one bad sub-agent becomes a value in the results
+  dict, not a crash that takes the batch down. This is what makes
+  `OrchestrationDriver`'s escalate-and-retry possible at all: it needs to
+  see *which* nodes failed without losing the ones that didn't.
+- **`harness_factory`/`harness_builder` take the node, not zero args.**
+  The original `SubAgentSpawner.harness_factory: Callable[[], SubAgentRunner]`
+  had no way to give different nodes different config — every node got a
+  harness from the same call. Both `SubAgentSpawner.harness_factory` and
+  `OrchestrationDriver.harness_builder` now take `(node[, tier])`, which is
+  what actually lets `run_orchestrated.py` give each node its own `run_id`
+  and trace path and lets `OrchestrationDriver` rebuild a node's harness at
+  an escalated tier on retry.
+- **No `run_id` override was added to `AgentHarness.run()`, unlike the
+  todo's original fix-shape note.** `AgentFSM`/`messages` are
+  per-`AgentHarness`-instance mutable state (Module 5/7), so a harness
+  instance is already single-run by construction — reusing one across
+  multiple `run_id`s via a `run(task, run_id=...)` override would mean
+  either resetting `self.fsm` mid-instance-lifetime (fragile) or silently
+  carrying stale FSM/step state into the next `run_id` (a bug). Since
+  `harness_factory`/`harness_builder` already construct a fresh
+  `AgentHarness` per node (required anyway — `self.fsm` isn't safe to share
+  across the spawner's concurrent threads), `run_id` is simplest set once,
+  at that construction, not threaded through `run()`.
+- **A retry escalates only the failed node, not the whole batch.**
+  `OrchestrationDriver.run()` re-submits just the nodes that failed and
+  haven't hit `max_attempts` to a fresh `SubAgentSpawner.run_dag` call each
+  pass, at each retried node's own newly-escalated tier — nodes that
+  already succeeded are never touched again, so a flaky sibling can't cost
+  a working node a second, redundant charge against `max_iterations`.
+- **`SubAgentSpawner.run_dag` still runs every submitted node fully in
+  parallel — there's no dependency-edge resolution between nodes.** The
+  "DAG" in `DagNode` names the roadmap's target shape, not what's
+  implemented: nodes are treated as independent, not ordered by any edge
+  one node might logically depend on. That was already true before this
+  fix and remains a real simplification, not something newly introduced
+  here.
+
+Tested in `tests/test_module_10_orchestration.py` (router behavior, and the
+spawner completing all nodes under `max_workers` while capturing a failing
+node's error without losing a sibling's result) and
+`tests/test_orchestration_driver.py` (a node's starting tier comes from its
+difficulty, a failing node is retried one tier up and its `result`/
+`tier_used`/`attempts` reflect that, a node that keeps failing gives up
+after `max_attempts`, and one node's failure never blocks a sibling from
+completing).
 
 ## Design decisions worth calling out
 
@@ -535,12 +598,13 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail; see it for what's still open (semantic memory unused, no real
-multi-agent driver, prompts not versioned, and further down the priority
+detail; see it for what's still open (semantic memory unused, no LLM-driven
+task decomposition, prompts not versioned, and further down the priority
 list).
 
 (Unbounded context growth, checkpoint resume, cost/token tracking, approval-
-gate crash durability, an overly permissive retry policy, and durable facts
-memory being built but unused were the most load-bearing items in this
-list; all six are now fixed — see Module 4, Module 6, Module 7, Module 8,
-and Module 9 above.)
+gate crash durability, an overly permissive retry policy, durable facts
+memory being built but unused, and orchestration never composed into a real
+driver were the most load-bearing items in this list; all seven are now
+fixed — see Module 4, Module 6, Module 7, Module 8, Module 9, and Module 10
+above.)
