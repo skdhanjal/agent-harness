@@ -1,24 +1,24 @@
-"""Wire up OrchestrationDriver end-to-end: run a DAG of independent subtasks,
-each as its own full AgentHarness, routed to a model tier by difficulty and
-escalated one tier up if it fails.
+"""Wire up OrchestrationDriver end-to-end: decompose one task string into a
+DAG of independent subtasks, run each as its own full AgentHarness, routed
+to a model tier by difficulty and escalated one tier up if it fails.
 
 Each node gets its own run_id, trace file, and checkpoint dir, nested under
-the parent orchestration run -- see build_harness() below. Task decomposition
-(turning one task string into this DAG) isn't done here; DEFAULT_NODES is a
-hand-written example. See docs/production_readiness_todo.md.
+the parent orchestration run -- see build_harness() below.
 
 Usage:
-    uv run python run_orchestrated.py
+    uv run python run_orchestrated.py ["task"]
 """
 
 from __future__ import annotations
 
+import sys
 import uuid
 
 from agent_harness.framework import AgentHarness
 from agent_harness.gates.approval import ApprovalGate, PendingAction, RiskTier
 from agent_harness.memory.durable_store import DurableStateStore
 from agent_harness.memory.tools import register_memory_tools
+from agent_harness.orchestration.decomposition import decompose_task
 from agent_harness.orchestration.driver import OrchestrationDriver
 from agent_harness.orchestration.router import ModelRouter, ModelTier
 from agent_harness.orchestration.spawner import DagNode
@@ -38,25 +38,10 @@ TIERS = [
     ModelTier(name="gpt-4o", cost_per_1k=0.0025, capability_rank=1),
 ]
 
-DEFAULT_NODES = [
-    DagNode(
-        id="photosynthesis",
-        task="Write study notes about photosynthesis and save "
-        "them as Markdown to notes/photosynthesis.md.",
-        difficulty=0,
-    ),
-    DagNode(
-        id="mitosis",
-        task="Write study notes about mitosis and save them as Markdown to notes/mitosis.md.",
-        difficulty=0,
-    ),
-    DagNode(
-        id="thermodynamics",
-        task="Write study notes about the laws of thermodynamics "
-        "and save them as Markdown to notes/thermodynamics.md.",
-        difficulty=1,
-    ),
-]
+DEFAULT_TASK = (
+    "Write study notes about photosynthesis, mitosis, and the laws of "
+    "thermodynamics, saving each topic as its own Markdown file under notes/."
+)
 
 RISK_BY_TOOL = {
     "read_file": RiskTier.LOW,
@@ -117,8 +102,13 @@ def build_harness(node: DagNode, tier: ModelTier, parent_run_id: str) -> AgentHa
 
 
 def main() -> None:
+    task = " ".join(sys.argv[1:]) or DEFAULT_TASK
     parent_run_id = f"orchestrated-{uuid.uuid4().hex[:8]}"
-    print(f"[run] parent_run_id={parent_run_id} nodes={[n.id for n in DEFAULT_NODES]}")
+
+    # Cheap tier only, for the one-shot decomposition call -- not one of the
+    # per-node harness clients, which are built per-tier in build_harness().
+    nodes = decompose_task(task, OpenAIChatClient(model=TIERS[0].name))
+    print(f"[run] parent_run_id={parent_run_id} task={task!r} nodes={[n.id for n in nodes]}")
 
     driver = OrchestrationDriver(
         router=ModelRouter(TIERS),
@@ -126,7 +116,7 @@ def main() -> None:
         max_workers=4,
         max_attempts=3,
     )
-    results = driver.run(DEFAULT_NODES)
+    results = driver.run(nodes)
 
     print("\n=== RESULTS ===")
     for node_id, node_result in results.items():

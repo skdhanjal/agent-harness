@@ -168,6 +168,24 @@ moving into `AgentHarness`, and why the user-half template is a trivial
 Module 3 section. Tested in `tests/test_module_03_prompt_ownership.py` and
 `tests/test_framework.py::test_harness_logs_prompt_id_at_run_start`.
 
+### LLM-driven task decomposition not implemented — fixed
+New `agent_harness/orchestration/decomposition.py`'s `decompose_task(task,
+client)` turns one task string into a `list[DagNode]` via
+`generate_structured` (Module 1), reusing the `ChatClient` protocol the
+same way `LLMJudge` already does. It rejects and re-prompts on an empty
+decomposition, duplicate ids, a `depends_on` referencing an unknown id, a
+cyclic dependency graph, and — the check that actually matters given
+`SubAgentSpawner.run_dag`'s real capability — any non-empty `depends_on`
+at all, since nodes always run fully in parallel. `run_orchestrated.py`
+now takes a task string (`sys.argv`, same pattern as `run_agent.py`) and
+calls `decompose_task` instead of using a hand-written `DEFAULT_NODES`.
+Full design rationale — why `depends_on` stays in the schema as a reject
+condition rather than being dropped or partially supported, why the
+business-rule retry loop is separate from `generate_structured`'s own
+schema-repair loop, why decomposition is its own module rather than folded
+into `driver.py` — is written up in `docs/agent_harness_roadmap.md`'s
+Module 10 section. Tested in `tests/test_task_decomposition.py`.
+
 ## Medium (scale/quality)
 
 ### 1. Semantic memory (VectorMemory) still unwired
@@ -188,24 +206,9 @@ local embedder (weaker retrieval quality, zero extra cost/dependency) —
 plus a persistence format for the vectors, before it's a well-scoped
 wiring change like the facts-memory fix was.
 
-### 2. LLM-driven task decomposition not implemented
-`OrchestrationDriver` (`agent_harness/orchestration/driver.py`, see "Fixed"
-above) and `run_orchestrated.py` both take an already-built `list[DagNode]`
-— nothing turns one task string into that list. `run_orchestrated.py`'s
-`DEFAULT_NODES` is hand-written, so orchestration only actually runs for a
-task someone has already broken into independent subtasks by hand.
-
-Fix shape: a `decompose_task(task: str, client: ...) -> list[DagNode]` step
-that prompts the model for a subtask breakdown (via `generate_structured`,
-Module 1) and validates the result — at minimum reject-and-retry on a cyclic
-or empty decomposition, since `SubAgentSpawner.run_dag` has no dependency-
-edge resolution to fall back on (nodes already run fully in parallel, so a
-decomposition that assumes ordering between nodes would silently be wrong,
-not just slow).
-
 ## Lower priority (hardening/DX)
 
-### 3. Missing capstone integration test
+### 2. Missing capstone integration test
 `docs/agent_harness_roadmap.md`'s closing step describes
 `tests/test_capstone.py`: a multi-step task through a real approval gate and
 forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
@@ -215,31 +218,31 @@ exist. Checkpoint resume and cost tracking (both above) are done, so this
 test is now fully writable against real behavior — nothing else on this list
 blocks it anymore.
 
-### 4. No CI coverage-threshold enforcement
+### 3. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 5. No installable CLI / packaging
+### 4. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 6. Single-provider lock-in
+### 5. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 7. `TraceLedger` has no rotation/retention policy
+### 6. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 8. No process-wide concurrency cap across parallel sub-agent runs
+### 7. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process

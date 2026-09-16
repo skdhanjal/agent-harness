@@ -115,7 +115,8 @@ agent_harness/
 └── orchestration/
     ├── router.py             # ModelRouter: tier selection + escalate-on-failure
     ├── spawner.py              # SubAgentSpawner: bounded-concurrency DAG execution
-    └── driver.py                # OrchestrationDriver: composes both into a real driver
+    ├── driver.py                # OrchestrationDriver: composes both into a real driver
+    └── decomposition.py          # decompose_task: task string -> list[DagNode]
 ```
 
 ## Module reference
@@ -515,9 +516,21 @@ re-run. `run_orchestrated.py` is the multi-agent counterpart to
 `run_agent.py`: it builds a real per-node `AgentHarness` (own `run_id`,
 trace file, and checkpoint dir, nested under the parent orchestration run)
 via `OrchestrationDriver`'s injected `harness_builder`. Task decomposition
-— turning one task string into a `DagNode` list — isn't part of this;
-`run_orchestrated.py`'s `DEFAULT_NODES` is hand-written. See
-`docs/production_readiness_todo.md`.
+— turning one task string into a `DagNode` list — isn't part of
+`OrchestrationDriver`/`SubAgentSpawner` themselves; it's a separate step,
+`decompose_task` (`orchestration/decomposition.py`), that `run_orchestrated.py`
+calls first to build the `DagNode` list it then hands to the driver.
+
+`decompose_task` reuses Module 1's `generate_structured`/`ChatClient` — the
+same reuse `LLMJudge` (Module 9) already does — to ask the model for a
+`TaskDecomposition` (a list of `SubtaskSpec`s: `id`, `task`, `difficulty`,
+`depends_on`). It runs its own outer retry loop around that call, rejecting
+and re-prompting on an empty decomposition, duplicate ids, a `depends_on`
+referencing an unknown id, a cyclic dependency graph, or — the check that
+actually matters given `SubAgentSpawner.run_dag`'s real capability — any
+non-empty `depends_on` at all, since nodes always run fully in parallel
+(see the "no dependency-edge resolution" bullet above). Exhausting
+`max_attempts` raises `TaskDecompositionError` naming the last failure.
 
 **Why this design:**
 
@@ -564,15 +577,51 @@ via `OrchestrationDriver`'s injected `harness_builder`. Task decomposition
   one node might logically depend on. That was already true before this
   fix and remains a real simplification, not something newly introduced
   here.
+- **`depends_on` stays in `SubtaskSpec`'s schema, but is a reject condition
+  today, not a partially-supported feature.** Dropping the field entirely
+  would just push the same problem onto the model in a less legible form —
+  it would still sometimes think in terms of "step 2 needs step 1's
+  output," just with nowhere to say so, making that assumption invisible
+  instead of catchable. Keeping the field and rejecting any non-empty use
+  of it gives `decompose_task` a concrete signal to retry on, and gives a
+  future fix (if `SubAgentSpawner` ever grows real dependency-edge
+  resolution) a schema that's already shaped for it.
+- **The business-rule retry loop is separate from `generate_structured`'s
+  own repair loop.** `generate_structured`'s `max_repairs` only ever
+  reacts to a `ValidationError` — malformed JSON or a field of the wrong
+  type. "Empty," "cyclic," and "has any `depends_on`" are all schema-valid
+  `TaskDecomposition` objects; nothing about `SubtaskSpec`'s pydantic
+  fields can express them as a validation error. `decompose_task` wraps
+  `generate_structured` in its own loop that re-prompts with the specific
+  reason the *previous* attempt was rejected, which also cleanly covers
+  the case where `generate_structured` itself exhausts its retries and
+  raises `StructuredOutputError` — that's just one more reason to retry
+  the outer loop, not a different failure category.
+- **Decomposition is its own module, not folded into `driver.py`.**
+  `OrchestrationDriver` composes `ModelRouter` and `SubAgentSpawner` over
+  an already-built `DagNode` list; it has no dependency on Module 1 today.
+  Putting `decompose_task` there would give the driver a new dependency
+  (`generate_structured`/`ChatClient`) it doesn't otherwise need, and would
+  conflate "run this DAG" with "build this DAG" — two different callers
+  might want one without the other (e.g. a caller that already has its own
+  hand-built `DagNode` list has no reason to touch `decompose_task` at
+  all). This is also the one legitimate `M1 → M10` edge in the module
+  dependency graph below — everything else `OrchestrationDriver` needs
+  comes from M7-M9.
 
 Tested in `tests/test_module_10_orchestration.py` (router behavior, and the
 spawner completing all nodes under `max_workers` while capturing a failing
-node's error without losing a sibling's result) and
-`tests/test_orchestration_driver.py` (a node's starting tier comes from its
-difficulty, a failing node is retried one tier up and its `result`/
-`tier_used`/`attempts` reflect that, a node that keeps failing gives up
-after `max_attempts`, and one node's failure never blocks a sibling from
-completing).
+node's error without losing a sibling's result), `tests/test_orchestration_driver.py`
+(a node's starting tier comes from its difficulty, a failing node is
+retried one tier up and its `result`/`tier_used`/`attempts` reflect that, a
+node that keeps failing gives up after `max_attempts`, and one node's
+failure never blocks a sibling from completing), and
+`tests/test_task_decomposition.py` (a valid decomposition becomes matching
+`DagNode`s; an empty, duplicate-id, unknown-dependency, cyclic, or
+any-non-empty-`depends_on` decomposition is rejected and retried rather
+than handed to `SubAgentSpawner`; a `StructuredOutputError` from
+`generate_structured` itself is retried the same way; persistently invalid
+output raises `TaskDecompositionError` after exactly `max_attempts`).
 
 ## Design decisions worth calling out
 
@@ -620,6 +669,7 @@ flowchart LR
     M7 --> M10[10. Adaptive Orchestration]
     M8 --> M10
     M9 --> M10
+    M1 --> M10
 ```
 
 1-3 are the typed I/O contracts (structured outputs, tool safety, versioned
@@ -628,20 +678,23 @@ loop with a context budget and deterministic control. 6-7 make the loop
 stateful and crash-resilient. 8-9 add safety and observability, both only
 meaningful once a real loop exists to gate or watch. 10 is the capstone:
 it composes the whole harness as the unit it routes between model tiers and
-spawns copies of.
+spawns copies of. The direct `M1 → M10` edge is the one exception to "10
+only depends on 7-9" — `orchestration/decomposition.py`'s `decompose_task`
+calls `generate_structured` directly, the same reuse `LLMJudge` (Module 9)
+already does for M1.
 
 ## Known gaps
 
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail; see it for what's still open (semantic memory unused, no LLM-driven
-task decomposition, and further down the priority list).
+detail; see it for what's still open (semantic memory unused, and further
+down the priority list).
 
 (Unbounded context growth, checkpoint resume, cost/token tracking, approval-
 gate crash durability, an overly permissive retry policy, durable facts
 memory being built but unused, and orchestration never composed into a real
 driver were the most load-bearing items in this list; all seven are now
 fixed — see Module 4, Module 6, Module 7, Module 8, Module 9, and Module 10
-above. Prompts not being versioned in the live loop is fixed too — see
-Module 3 above.)
+above. Prompts not being versioned in the live loop and LLM-driven task
+decomposition are fixed too — see Module 3 and Module 10 above.)

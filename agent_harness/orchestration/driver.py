@@ -6,7 +6,8 @@ first failure.
 
 Task decomposition -- turning one task string into a DagNode list -- isn't
 done here; the caller supplies the DAG. See
-docs/production_readiness_todo.md.
+`agent_harness/orchestration/decomposition.py`'s `decompose_task`, used by
+`run_orchestrated.py`.
 """
 
 from __future__ import annotations
