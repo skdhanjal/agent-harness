@@ -186,6 +186,25 @@ schema-repair loop, why decomposition is its own module rather than folded
 into `driver.py` — is written up in `docs/agent_harness_roadmap.md`'s
 Module 10 section. Tested in `tests/test_task_decomposition.py`.
 
+### Missing capstone integration test — fixed
+New `tests/test_capstone.py` exercises `AgentHarness`, `ApprovalGate`,
+checkpointing/resume, `TraceLedger`, and `LLMJudge` together in one
+continuous run instead of each module's own isolated test file:
+`test_capstone_survives_crash_and_resume_with_gapless_trace_and_valid_output`
+runs a two-tool-call batch through a real `ApprovalGate`, forces a
+mid-batch crash (`FatalError` while approving the second call, same
+technique as `tests/test_framework.py`'s mid-batch resume test), asserts
+the resulting checkpoint captured exactly the first call's result, resumes
+into a fresh `AgentHarness`, validates the resumed run's final answer
+against a local `RunSummary` pydantic schema, and asserts the trace ledger
+has exactly the expected `run_start`/`llm_call`/`tool_call` event counts
+and total cost across both the pre-crash and post-resume turns.
+`test_capstone_llm_judge_scores_three_deterministic_runs_consistently`
+runs the same scripted scenario 3 times, confirms identical output each
+time, and scores each run's trajectory with `LLMJudge`. No production code
+changed — this was purely a missing-test gap, not a wiring gap like the
+other items above.
+
 ## Medium (scale/quality)
 
 ### 1. Semantic memory (VectorMemory) still unwired
@@ -208,41 +227,31 @@ wiring change like the facts-memory fix was.
 
 ## Lower priority (hardening/DX)
 
-### 2. Missing capstone integration test
-`docs/agent_harness_roadmap.md`'s closing step describes
-`tests/test_capstone.py`: a multi-step task through a real approval gate and
-forced checkpoint, a simulated crash-and-resume via `load_checkpoint`, final
-output schema validation, a gapless trace ledger with correct total cost, and
-an `LLMJudge` pass across 3 deterministic runs. This file still doesn't
-exist. Checkpoint resume and cost tracking (both above) are done, so this
-test is now fully writable against real behavior — nothing else on this list
-blocks it anymore.
-
-### 3. No CI coverage-threshold enforcement
+### 2. No CI coverage-threshold enforcement
 `pyproject.toml`'s `[tool.pytest.ini_options].addopts` reports coverage
 (`--cov=agent_harness --cov-report=term-missing`) but has no
 `--cov-fail-under=N`, so `.github/workflows/ci.yml` can't fail a PR that
 regresses coverage — it only fails on outright test failures.
 
-### 4. No installable CLI / packaging
+### 3. No installable CLI / packaging
 No `[project.scripts]` table in `pyproject.toml`. `run_agent.py` (invoked via
 `uv run python run_agent.py "task"`) is the only entry point — no
 `agent-harness run "task"` command, no config file for model/risk-tier/root
 selection instead of editing the script directly.
 
-### 5. Single-provider lock-in
+### 4. Single-provider lock-in
 `ChatClient` (`agent_harness/schemas/structured.py`) and
 `ToolCallingChatClient` (`agent_harness/schemas/tool_calling.py`) are both
 provider-agnostic `Protocol`s by design, but `OpenAIChatClient` is the only
 implementation that exists. Nothing proves the abstraction actually holds
 for a second provider, and there's no runtime provider-selection mechanism.
 
-### 6. `TraceLedger` has no rotation/retention policy
+### 5. `TraceLedger` has no rotation/retention policy
 A failure mode the roadmap itself calls out under Module 9 ("trace volume
 growing unbounded... becomes an ops problem") but never addresses — `TraceLedger.log()`
 just appends to one JSONL file forever.
 
-### 7. No process-wide concurrency cap across parallel sub-agent runs
+### 6. No process-wide concurrency cap across parallel sub-agent runs
 `SubAgentSpawner`'s `max_workers` (`agent_harness/orchestration/spawner.py`)
 caps concurrency *within one spawner instance*, but nothing caps total
 concurrent API spend if multiple spawners/harnesses run in the same process
