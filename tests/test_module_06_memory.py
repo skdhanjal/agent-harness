@@ -60,3 +60,11 @@ def test_durable_store_missing_key_returns_none(tmp_path: Path) -> None:
     store = DurableStateStore(tmp_path / "state.json")
 
     assert store.get("does_not_exist") is None
+
+
+def test_durable_store_keys_lists_everything_set(tmp_path: Path) -> None:
+    store = DurableStateStore(tmp_path / "state.json")
+    store.set("user_name", "Sam")
+    store.set("favorite_color", "blue")
+
+    assert sorted(store.keys()) == ["favorite_color", "user_name"]

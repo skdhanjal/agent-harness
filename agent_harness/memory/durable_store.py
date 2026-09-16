@@ -28,3 +28,6 @@ class DurableStateStore:
         data = self._read()
         data[key] = value
         self._path.write_text(json.dumps(data))
+
+    def keys(self) -> list[str]:
+        return list(self._read().keys())

@@ -14,10 +14,16 @@ import uuid
 
 from agent_harness.framework import AgentHarness
 from agent_harness.gates.approval import ApprovalGate, PendingAction, RiskTier
+from agent_harness.memory.durable_store import DurableStateStore
+from agent_harness.memory.tools import register_memory_tools
 from agent_harness.schemas.openai_client import OpenAIChatClient
 from agent_harness.tools.filesystem import register_filesystem_tools
 from agent_harness.tools.registry import ToolRegistry
 from agent_harness.tracing.ledger import TraceLedger
+
+# Shared across runs (unlike run_output/{run_id}/...) -- this is the whole point
+# of durable memory: facts survive past the process that wrote them.
+MEMORY_PATH = "./agent_memory/facts.json"
 
 DEFAULT_TASK = (
     "Write study notes about how photosynthesis works and save them as "
@@ -35,6 +41,11 @@ RISK_BY_TOOL = {
     "write_file": RiskTier.HIGH,
     "move_file": RiskTier.HIGH,
     "delete_file": RiskTier.HIGH,
+    # memory is a self-contained store, not the user's own files -- writes
+    # here get a lighter tier than a filesystem write
+    "recall_fact": RiskTier.LOW,
+    "list_facts": RiskTier.LOW,
+    "remember_fact": RiskTier.MEDIUM,
 }
 
 
@@ -49,6 +60,7 @@ def main() -> None:
 
     tools = ToolRegistry()
     register_filesystem_tools(tools, root=".")
+    register_memory_tools(tools, DurableStateStore(MEMORY_PATH))
 
     harness = AgentHarness(
         client=OpenAIChatClient(model="gpt-4o-mini"),
@@ -65,8 +77,12 @@ def main() -> None:
             "rooted at the current project directory. You have these tools: "
             "read_file, write_file, list_files, glob_files, grep_files, file_stat, "
             "make_directory, move_file, delete_file -- all paths are relative to "
-            "the workspace root. Use whichever tools the task requires, then give "
-            "a final_answer describing what you did or found."
+            "the workspace root. You also have remember_fact, recall_fact, and "
+            "list_facts, which persist key-value facts across separate runs, not "
+            "just this conversation -- use them for things worth knowing next "
+            "time (user preferences, stable project facts), not for scratch "
+            "state from this task alone. Use whichever tools the task requires, "
+            "then give a final_answer describing what you did or found."
         ),
         risk_by_tool=RISK_BY_TOOL,
         max_iterations=6,

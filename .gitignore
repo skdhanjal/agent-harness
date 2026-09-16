@@ -222,4 +222,5 @@ traces.jsonl
 checkpoints/
 pending_actions/
 run_output/
+agent_memory/
 CLAUDE.md

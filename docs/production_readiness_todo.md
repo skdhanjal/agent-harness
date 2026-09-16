@@ -80,6 +80,30 @@ persisted before the approver runs; a resumed gate replays an already-made
 approval/denial without re-asking) and `tests/test_framework.py`
 (`test_harness_resumes_mid_tool_call_batch_without_reexecuting_or_reasking`).
 
+### Durable facts memory built but unused — fixed
+`DurableStateStore` (`agent_harness/memory/durable_store.py`) is now wired
+into `run_agent.py` via a new `agent_harness/memory/tools.py` —
+`register_memory_tools()` exposes it to the model as `remember_fact`,
+`recall_fact`, and `list_facts`, the same way `register_filesystem_tools()`
+exposes the sandboxed filesystem. Unlike every other run artifact
+(checkpoints, pending actions, traces), the store lives at one fixed path
+shared across `run_id`s (`run_agent.py`'s `MEMORY_PATH`), not a per-run one
+— a fact now genuinely survives the process that wrote it. Full design
+rationale — why this is tool exposure rather than an `AgentHarness`
+constructor field or automatic context injection, why the store is
+cross-run rather than per-run, and why `remember_fact` sits at
+`RiskTier.MEDIUM` rather than `HIGH` — is written up in
+`docs/agent_harness_roadmap.md`'s Module 6 section. Tested in
+`tests/test_memory_tools.py` (tools round-trip through the registry's
+normal validate-execute path, and a fact survives a fresh
+`DurableStateStore` instance pointed at the same file).
+
+`VectorMemory` (semantic retrieval) is deliberately **not** part of this
+fix — see "Semantic memory (VectorMemory) still unwired" below, now split
+out as its own item since it turned out to need a materially different kind
+of decision (an embeddings provider and a persistence format that don't
+exist yet, not just a wiring change).
+
 ### Retry policy too permissive — fixed
 `OpenAIChatClient` (`agent_harness/schemas/openai_client.py`) now catches the
 OpenAI SDK's non-retryable client errors (`AuthenticationError`,
@@ -95,17 +119,23 @@ stay retryable, since that's exactly what backoff is for. Tested in
 
 ## Medium (scale/quality)
 
-### 1. Memory tiers built but unused
-`DurableStateStore` and `VectorMemory` (`agent_harness/memory/`) are fully
-implemented and independently tested but never imported by `framework.py` or
-`run_agent.py`. `AgentHarness` has no memory-store fields; every run starts
-from a blank slate beyond its own `messages` list, and nothing survives
-across separate runs (user preferences, facts learned in a previous session,
-semantic recall of prior work).
+### 1. Semantic memory (VectorMemory) still unwired
+`VectorMemory` (`agent_harness/memory/vector_memory.py`) is fully
+implemented and independently tested but never imported by `framework.py`
+or `run_agent.py` — facts memory (`DurableStateStore`) is fixed (see
+above), but semantic recall of prior work (e.g. "what did I do last time on
+a task like this") still isn't available. This is a materially bigger lift
+than the facts-memory fix was: `VectorMemory` has no disk persistence at
+all today (in-memory `_texts`/`_vectors` lists, gone at process exit), and
+no embedding provider exists anywhere in the codebase —
+`OpenAIChatClient` (`agent_harness/schemas/openai_client.py`) has no
+`embed()` method, only chat completions.
 
-Fix shape: needs a product decision first — what should actually be
-persisted across runs for *this* harness's use case — before it's worth
-wiring in mechanically.
+Fix shape: needs its own product decision — real OpenAI embeddings
+(`text-embedding-3-small`, a second billed API surface) vs. a lightweight
+local embedder (weaker retrieval quality, zero extra cost/dependency) —
+plus a persistence format for the vectors, before it's a well-scoped
+wiring change like the facts-memory fix was.
 
 ### 2. Orchestration not composed into a real driver
 `ModelRouter`/`SubAgentSpawner` (`agent_harness/orchestration/`) are only

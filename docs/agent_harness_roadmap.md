@@ -100,8 +100,9 @@ agent_harness/
 ├── control_flow/state_machine.py   # AgentFSM
 ├── memory/
 │   ├── sliding_window.py    # no longer used by the live loop (see Module 6 below)
-│   ├── durable_store.py      # built, not yet wired in (see gaps)
-│   └── vector_memory.py       # built, not yet wired in (see gaps)
+│   ├── durable_store.py      # crash-durable key-value facts, wired in via tools.py
+│   ├── tools.py                # register_memory_tools(): exposes the store to the model
+│   └── vector_memory.py         # built, not yet wired in (see gaps)
 ├── persistence/
 │   ├── checkpoint.py        # save_checkpoint/load_checkpoint
 │   └── retry.py               # with_backoff, FatalError
@@ -262,12 +263,53 @@ Tested in `tests/test_module_05_control_flow.py`.
 became native, the real `messages` list already carries full turn-by-turn
 history (tool requests and results linked by `tool_call_id`), which made
 the separate paraphrased memory log redundant — keeping both in sync would
-have been pure risk for no benefit. `DurableStateStore` (crash-durable
-key-value facts) and `VectorMemory` (semantic retrieval) are both fully
-built and independently tested but not wired into the harness at all yet.
-See `docs/production_readiness_todo.md`.
+have been pure risk for no benefit.
 
-Tested in `tests/test_module_06_memory.py`.
+`DurableStateStore` (crash-durable key-value facts) is wired into
+`run_agent.py` as tools, not as an `AgentHarness` field:
+`memory/tools.py`'s `register_memory_tools()` exposes `remember_fact`,
+`recall_fact`, and `list_facts` through the same `ToolRegistry` that
+`register_filesystem_tools()` uses, pointed at a fixed path
+(`run_agent.py`'s `MEMORY_PATH`, `./agent_memory/facts.json`) instead of a
+per-run one — the whole point is that a fact survives the `run_id` that
+wrote it. `VectorMemory` (semantic retrieval) is still fully built and
+independently tested but *not* wired in — see `docs/production_readiness_todo.md`
+for why that's a separate, larger decision than this one was.
+
+**Why this design:**
+
+- **Tools, not an automatic context injection.** The harness doesn't decide
+  what's "worth remembering" or silently prepend prior facts to the system
+  prompt — the model calls `remember_fact`/`recall_fact`/`list_facts`
+  itself, the same way it decides when to call `write_file`. This keeps
+  `AgentHarness` itself unchanged (no new constructor field, no new
+  `_run_loop` branch) and keeps memory content inspectable in the trace
+  ledger like any other tool call, rather than invisible context the model
+  never explicitly asked for.
+- **One shared store across all runs, not one per `run_id`.** Every other
+  per-run artifact (checkpoints, pending actions, traces) lives under
+  `./run_output/{run_id}/...` because it's scoped to that run's crash
+  recovery. `MEMORY_PATH` deliberately isn't — a fact that only outlives
+  its own run wouldn't be solving the problem this module names ("nothing
+  survives across separate runs").
+- **`remember_fact` is `RiskTier.MEDIUM` in `run_agent.py`, not `HIGH` like
+  `write_file`.** It's a side effect, so `LOW` (reads-only) would be wrong,
+  but it only touches the harness's own self-contained store, never the
+  user's actual project files, so it doesn't need the same gate as
+  `write_file`/`move_file`/`delete_file`.
+- **`VectorMemory` wasn't wired alongside it.** Unlike `DurableStateStore`,
+  it has no disk persistence at all today (in-memory `_texts`/`_vectors`
+  lists only) and no embedding provider exists anywhere in the codebase
+  (`OpenAIChatClient` has no `embed()` method) — wiring it for real means
+  adding both a persistence layer and a real embeddings dependency, a
+  product decision on its own rather than a mechanical follow-on to this
+  one.
+
+Tested in `tests/test_module_06_memory.py` (store/registry primitives) and
+`tests/test_memory_tools.py` (tools execute through the same
+validate-execute-never-raise path as any other tool, and a fact written by
+one `DurableStateStore` instance is read back by a fresh one pointed at the
+same file — proving cross-run survival, not just in-process reuse).
 
 ### 7. Checkpointing & Safe Retries — `persistence/`
 
@@ -493,11 +535,12 @@ spawns copies of.
 Every module above passes its own test in isolation — that's not the same
 as the whole system being safe to run unattended against real work.
 `docs/production_readiness_todo.md` tracks that gap in full, prioritized
-detail; see it for what's still open (memory tiers unused, no real
+detail; see it for what's still open (semantic memory unused, no real
 multi-agent driver, prompts not versioned, and further down the priority
 list).
 
 (Unbounded context growth, checkpoint resume, cost/token tracking, approval-
-gate crash durability, and an overly permissive retry policy were the most
-load-bearing items in this list; all five are now fixed — see Module 4,
-Module 7, Module 8, and Module 9 above.)
+gate crash durability, an overly permissive retry policy, and durable facts
+memory being built but unused were the most load-bearing items in this
+list; all six are now fixed — see Module 4, Module 6, Module 7, Module 8,
+and Module 9 above.)
